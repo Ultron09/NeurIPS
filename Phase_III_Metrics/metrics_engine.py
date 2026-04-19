@@ -69,3 +69,10 @@ class MetricsEngine:
         plt.tight_layout()
         plt.savefig(filename, dpi=300)
         plt.close()
+
+if __name__ == "__main__":
+    print("Testing Metrics Engine...")
+    engine = MetricsEngine(num_tasks=10)
+    engine.update_result(0, 0, 0.85)
+    engine.generate_report()
+    print("Metrics Engine Verified.")

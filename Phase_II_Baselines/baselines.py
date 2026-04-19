@@ -160,3 +160,11 @@ class AGEM:
             projection = (dot_product / (torch.dot(ref_grad, ref_grad) + 1e-9)) * ref_grad
             return current_grad - projection
         return current_grad
+
+if __name__ == "__main__":
+    print("Testing Baselines...")
+    model = nn.Linear(10, 10)
+    ewc = EWC(model)
+    er = ExperienceReplay(buffer_size=100)
+    agem = AGEM(model)
+    print("Baselines Initialized Successfully.")
