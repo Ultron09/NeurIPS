@@ -1,29 +1,28 @@
-# Phase III: The Holy Trinity of Metrics
+# Phase III: Metrics Engine (Ri,j Matrix)
 
-Evaluation in the Continual Learning community requires more than simple loss curves. We utilize the $R_{i,j}$ matrix—where $R_{i,j}$ is the test classification accuracy on task $j$ after observing the last sample from task $i$—to derive the following key metrics.
+The Metrics Engine is the empirical heart of the evaluation suite, responsible for calculating the standardized "Triple Threat" of Continual Learning metrics.
 
-## Key Metrics
+## 📊 Standardized Metrics
 
 ### 1. Average Accuracy (ACC)
-- **Definition**: The mean accuracy across all tasks after the final task in the sequence has been learned.
-- **Goal**: High overall performance indicates the system's ability to maintain high-capacity storage of multiple tasks.
+The mean performance across all seen tasks after the curriculum is completed.
 
 ### 2. Backward Transfer (BWT)
-- **Definition**: Measures how learning new tasks affects performance on previously learned tasks.
-- **Significance**: ANTARA has demonstrated a BWT of **-0.0491**, indicating near-zero degradation. Replicating this on the Split CIFAR-100 benchmark is a core objective.
-- **Equation**: $\frac{1}{T-1} \sum_{i=1}^{T-1} (R_{T,i} - R_{i,i})$
+The influence of learning new tasks on the performance of previously learned tasks. 
+- **Goal**: $> -0.05$ (indicating minimal forgetting).
 
 ### 3. Forward Transfer (FWT)
-- **Definition**: Measures the capability of the model to leverage previous knowledge to perform on a new task without direct training (Zero-Shot capability).
-- **Equation**: $\frac{1}{T-1} \sum_{i=2}^T (R_{i-1,i} - \tilde{b}_i)$
+The zero-shot influence of past knowledge on future tasks.
+- **Goal**: $> 0.10$ (outperforming the random-guessing baseline).
+- **Hardening**: Our engine uses a 10% Task-Isolated baseline for FWT to ensure mathematical validity.
 
-## Usage
-The `metrics_engine.py` provides a standardized implementation of these equations and generates a **R-Matrix Heatmap** for visual validation.
-```python
-from metrics_engine import MetricsEngine
-engine = MetricsEngine(num_tasks=10)
-# Update results during training
-engine.update_result(current_task=9, eval_task=0, accuracy=0.85)
-# Print report
-engine.generate_report()
+## 🖼️ Accuracy Heatmaps
+The Ri,j Accuracy Matrix is visualized as a heatmap, where the row $i$ represents the training phase and column $j$ represents the evaluation domain. 
+- **Top-right triangle**: Forward Transfer potential.
+- **Lower-left triangle**: Stability/Forgetting signals.
+
+## 🚀 Usage (Standalone)
+Verify report generation logic:
+```bash
+python Phase_III_Metrics/metrics_engine.py
 ```

@@ -1,29 +1,24 @@
-# Phase II: The Adversarial Baselines
+# Phase II: Adversarial Baselines (EWC & A-GEM)
 
-To prove the superiority of the ANTARA framework, we evaluate it against the established State-of-the-Art (SOTA) baselines in Continual Learning.
+To validate ANTARA, we compare it against the most mathematically established safeguards in Continual Learning research.
 
-## Integrated Baselines
+## 📐 Implemented Baselines
 
-### 1. Elastic Weight Consolidation (EWC)
-- **Concept**: A regularization-based approach that slows down learning on weights important for past tasks.
-- **Mechanism**: Utilizes the diagonal of the Fisher Information Matrix (FIM) as a proxy for parameter importance.
-- **Weakness**: Often overly rigid, leading to poor plastic performance in high-complexity regimes like Split CIFAR-100.
+### 1. Online EWC (Elastic Weight Consolidation)
+Implemented according to **Schwarz et al. (2018)**. 
+- Unlike standard EWC which anchors to a single past task, **Online EWC** maintains a consolidated Fisher Information Matrix and a running mean of important weights $(\mu)$. 
+- This prevents "anchor drift" and allows the model to scale to long task sequences.
 
-### 2. Experience Replay (ER)
-- **Concept**: The standard memory-buffer baseline.
-- **Mechanism**: Interleaves a small subset of stored past samples with the current task's mini-batches.
-- **Weakness**: Vulnerable to the "recency bias" and limited by buffer size constraints.
+### 2. A-GEM (Averaged Gradient Episodic Memory)
+Implemented according to **Chaudhry et al. (2019)**.
+- **Gradient Projection**: Gradients are projected onto the null space of previous task gradients stored in a Reservoir Buffer.
+- **Surgical Orchestration**: Our implementation uses a 5-step grad-injection pattern that prevents primary gradient annihilation during reference backpasses.
 
-### 3. Averaged Gradient Episodic Memory (A-GEM)
-- **Concept**: Gradient projection as a constraint.
-- **Mechanism**: Ensures that the gradient update for the current task does not increase the loss on a reference batch from the episodic memory.
-- **Relationship to ANTARA**: This is ANTARA's closest philosophical rival, as it also uses gradient projection (similar to OGD). Demonstrating ANTARA's superior performance with lower computational overhead is a key goal.
+## 📂 Key Files
+- `baselines.py`: The core wrapper class for EWC anchors and A-GEM projection logic.
 
-## Implementation Standard
-All baselines are implemented in **native PyTorch** to ensure maximum transparency during the NeurIPS review process.
-
-## Usage
-Import these from `baselines.py` within your training loop:
-```python
-from baselines import EWC, ExperienceReplay, AGEM
+## 🚀 Usage (Standalone)
+You can verify baseline initialization and mathematical validity by running:
+```bash
+python Phase_II_Baselines/baselines.py
 ```

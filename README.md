@@ -1,65 +1,50 @@
-# ANTARA: NeurIPS Evaluation Suite
-### Adaptive Neural Thinking Architecture for Recursive Autonomy
+# ANTARA NeurIPS Evaluation Suite: The Architectural Autopsy
 
-This repository contains the standardized evaluation suite for the **ANTARA** framework, designed for the NeurIPS Continual Learning track. The suite benchmarks ANTARA's "Living AI" capabilities—specifically its bi-cameral System 1/2 processing and Orthogonal Gradient Descent (OGD) protection—against the current State-of-the-Art in sequential learning.
+This repository contains the rigorous, mathematically hardened evaluation suite for the **ANTARA (Adaptive Neural Thinking Architecture for Recursive Analysis)** framework. It is designed to meet the extreme empirical standards of NeurIPS peer review.
 
----
+## 🔬 Overview
+The suite implements a 4-phase gauntlet to validate ANTARA's stability against catastrophic forgetting across non-stationary distributions (Split CIFAR-100). It features **Online EWC (Schwarz et al. 2018)**, **A-GEM (Chaudhry et al. 2019)**, and a **Surgical Logit Masking** engine to prevent softmax fratricide.
 
-## 🏗️ 4-Phase Evaluation Strategy
+## 📂 Project Structure
+- **[Phase I: Curriculum](./Phase_I_Curriculum)**: Deterministic 10-task Partitioning of CIFAR-100.
+- **[Phase II: Baselines](./Phase_II_Baselines)**: Online EWC and A-GEM reference implementations.
+- **[Phase III: Metrics](./Phase_III_Metrics)**: Ri,j Accuracy Matrix, ACC, BWT, and FWT calculation.
+- **[Phase IV: Ablation](./Phase_IV_Ablation)**: The parallel, self-healing Gauntlet orchestrator.
 
-The suite is decomposed into four critical phases, each ensuring the statistical rigor and mathematical transparency required for publication.
+## 🚀 Remote Execution Guide
 
-### Phase I: The 'Split CIFAR-100' Curriculum
-- **Standard**: Partitioning of CIFAR-100 into 10 disjoint tasks (10 classes each).
-- **Goal**: Proving resilience against extreme distribution shifts in a zero-rehearsal regime.
-- [View Phase I Details](./Phase_I_Curriculum/)
-
-### Phase II: The Adversarial Baselines
-- **Benchmarks**: Direct comparison against **EWC**, **Experience Replay (ER)**, and **A-GEM**.
-- **Implementation**: Native PyTorch implementations of all competitive algorithms to ensure fair comparison.
-- [View Phase II Details](./Phase_II_Baselines/)
-
-### Phase III: The Holy Trinity of Metrics
-- **Analytics**: Quantitative reporting using the $R_{i,j}$ matrix.
-- **Metrics**: Average Accuracy (**ACC**), Backward Transfer (**BWT**), and Forward Transfer (**FWT**).
-- [View Phase III Details](./Phase_III_Metrics/)
-
-### Phase IV: The Ablation Autopsy
-- **Architectural Proof**: Systematically disabling OGD and RGW (System 2) to demonstrate the synergistic necessity of each component.
-- [View Phase IV Details](./Phase_IV_Ablation/)
-
----
-
-## 🚀 Remote Quickstart
-
-This suite is designed for "Plug-and-Play" execution on remote high-performance compute (HPC) environments.
-
-### 1. Prerequisites
-Ensure you have the `airborne-antara` package installed:
+### 1. Environment Setup
+Clone the repository and install dependencies on your remote compute node:
 ```bash
+git clone https://github.com/Ultron09/NeurIPS.git
+cd NeurIPS
+pip install -r requirements.txt
 pip install airborne-antara
 ```
 
-### 2. Automated Setup
-Run the setup script to install all metrics and graphing dependencies:
+### 2. Parallel Gauntlet Launch
+Phase IV is optimized for parallel execution across multiple GPUs. You can launch individual ablation studies simultaneously:
+
 ```bash
-chmod +x remote_setup.sh
-./remote_setup.sh
+# Node 1: Full Framework
+python Phase_IV_Ablation/vanguard_full.py
+
+# Node 2: Stability Ablation
+python Phase_IV_Ablation/ablated_memory.py
+
+# Node 3: Deliberation Ablation
+python Phase_IV_Ablation/ablated_consciousness.py
+
+# Node 4: Baseline Control
+python Phase_IV_Ablation/naive_control.py
 ```
 
-### 3. Running Experiments
-Each phase can be triggered from its directory:
-```bash
-# Example: Run Ablation Study
-python Phase_IV_Ablation/ablation_runner.py
-```
+### 🛡️ Self-Healing Checkpointing
+All Phase IV scripts feature **automatic task-level state recovery**. If a run is interrupted (e.g., spot instance termination), simply re-run the script. It will automatically detect the `results/checkpoints/` directory and resume exactly from the last successfully completed task.
+
+## 📊 Results & Visualization
+All metrics and heatmaps are automatically saved to `Phase_IV_Ablation/results/`. These are formatted for high-resolution placement in a LaTeX NeurIPS manuscript.
 
 ---
-
-## 📊 Expected Outputs
-- **R-Matrix Heatmaps**: Visual evolution of task accuracy.
-- **Metric Reports**: Calculation of ACC, BWT, and FWT values.
-- **Ablation Comparisons**: Performance deltas for architectural verification.
-
----
-© 2026 ANTARA Research Team. Built for the future of Living Intelligence.
+**Lead Researchers:** Suryaansh Prithvijit Singh, Sonya Shelke  
+**Organization:** Airborne-Antara Research

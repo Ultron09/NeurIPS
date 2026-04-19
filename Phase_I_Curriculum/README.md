@@ -1,22 +1,24 @@
-# Phase I: The 'Split CIFAR-100' Curriculum
+# Phase I: The Split CIFAR-100 Curriculum
 
-This phase implements a standardized, "grueling" curriculum designed to test a model's resilience against severe distribution shifts. 
+This module handles the deterministic partitioning of the CIFAR-100 dataset into a non-stationary stream of 10 tasks.
 
-## The Task
-CIFAR-100 contains 100 object classes. Under the **Split CIFAR-100** protocol, the classes are partitioned into **10 distinct, sequential tasks**, with 10 classes per task.
+## 🏗️ The Curriculum Strategy
+Standard CIFAR-100 is divided into 10 sequential tasks, with 10 disjoint classes per task. 
 
-1. **Sequential Learning**: The model trains on Task 1, then Task 2, and so on.
-2. **Zero Visibility**: Once a new task begins, the training distribution of previous tasks becomes entirely invisible (no new samples provided).
-3. **Catastrophic Forgetting Test**: This curriculum is the gold standard for measuring a model's ability to retain historical knowledge without direct rehearsal.
+- **Task 1**: Classes 0-9
+- **Task 2**: Classes 10-19
+- ...
+- **Task 10**: Classes 90-99
 
-## Script Usage
+## 🛡️ Reproducibility Rigor
+To meet NeurIPS standards for bit-for-bit reproducibility, the `SplitCIFAR100` class utilizes a global `set_seed` utility and task-isolated `torch.Generator` instances. This ensures that the training/validation splits (90/10) and data ordering remain identical across every independent execution of the suite.
 
-Run the curriculum generator to verify the task partitions:
+## 📂 Key Files
+- `curriculum.py`: The core dataset partitioner and seed manager.
+
+## 🚀 Usage (Standalone)
+You can verify the curriculum splits by running:
 ```bash
-python curriculum.py
+python Phase_I_Curriculum/curriculum.py
 ```
-
-## Implementation Details
-- **Dataset**: `torchvision.datasets.CIFAR100`
-- **Normalization**: Per-channel mean/std for CIFAR-100.
-- **Task Sizes**: 5,000 training images and 1,000 test images per task (10 classes).
+This will download CIFAR-100 and print the task boundary indices.

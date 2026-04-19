@@ -8,9 +8,10 @@ class MetricsEngine:
     Standardizes Continual Learning metrics using the Ri,j accuracy matrix.
     Includes baseline calibration for Forward Transfer (FWT).
     """
-    def __init__(self, num_tasks: int = 10, classes_per_task: int = 10):
+    def __init__(self, num_tasks: int = 10, classes_per_task: int = 10, config_name: str = "Default"):
         self.num_tasks = num_tasks
         self.classes_per_task = classes_per_task
+        self.config_name = config_name
         
         # R[i, j] is the accuracy on task j after training on task i
         self.r_matrix = np.zeros((num_tasks, num_tasks))
@@ -48,8 +49,7 @@ class MetricsEngine:
         bwt = self.calculate_bwt()
         fwt = self.calculate_fwt()
         
-        print("\n" + "=" * 40)
-        print("     NEURIPS CONTINUAL LEARNING REPORT")
+        print(f"\n========================================\n     NEURIPS CONTINUAL LEARNING REPORT: {self.config_name}\n========================================\n")
         print("=" * 40)
         print(f"Average Accuracy (ACC):  {acc:.4f}")
         print(f"Backward Transfer (BWT): {bwt:.4f}")
@@ -69,6 +69,29 @@ class MetricsEngine:
         plt.tight_layout()
         plt.savefig(filename, dpi=300)
         plt.close()
+
+    def save_state(self, path):
+        """Serializes the R-matrix and metadata for resumption."""
+        import json
+        state = {
+            "config_name": self.config_name,
+            "num_tasks": self.num_tasks,
+            "classes_per_task": self.classes_per_task,
+            "r_matrix": self.r_matrix.tolist()
+        }
+        with open(path, 'w') as f:
+            json.dump(state, f, indent=4)
+
+    def load_state(self, path):
+        """Recovers the R-matrix and metadata from a previous run."""
+        import json
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                state = json.load(f)
+            self.r_matrix = np.array(state["r_matrix"])
+            self.config_name = state.get("config_name", self.config_name)
+            return True
+        return False
 
 if __name__ == "__main__":
     print("Testing Metrics Engine...")

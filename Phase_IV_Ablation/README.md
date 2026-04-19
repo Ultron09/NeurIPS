@@ -1,28 +1,36 @@
-# Phase IV: The Ablation Autopsy
+# Phase IV: The Architectural Autopsy (Ablation Gauntlet)
 
-Reviewers often perceive advanced frameworks as "black boxes." This phase systematically dismantles ANTARA to prove the necessity of each component—System 1 (Reflexive) and System 2 (Deliberative)—and the OGD protection layer.
+This is the flagship execution phase where the ANTARA framework is subjected to a 4-way comparison to prove the necessity of its cognitive components.
 
-## Experimental Configurations
+## 🏁 The Gauntlet Runs
 
-We conduct three distinct runs to identify the contribution of each module:
+We execute 4 distinct parallel scripts to populate the NeurIPS empirical tables:
 
-### Run 1: Full ANTARA (RGW + OGD)
-- **Active Components**: Recursive Global Workspace (RGW) and Orthogonal Gradient Descent (OGD).
-- **Hypothesis**: Provides maximum plasticity while maintaining rigid retention, achieving the SOTA balance between Forward (FWT) and Backward (BWT) transfer.
+1.  **`vanguard_full.py`**: The full ANTARA framework (Full protection).
+2.  **`ablated_memory.py`**: Disables consolidation (Stability test).
+3.  **`ablated_consciousness.py`**: Disables the Deliberative loop (Plasticity test).
+4.  **`naive_control.py`**: Standard fine-tuning (Failure baseline).
 
-### Run 2: OGD Disabled
-- **Active Components**: RGW only.
-- **Hypothesis**: Projects significant Forward Transfer efficiency but suffers from catastrophic forgetting (BWT), proving the necessity of the projection layer for long-term survival.
+## 🛡️ Self-Healing Architecture
+Remote compute can be volatile. Phase IV implements **Atomic Resumption**. 
+- Status is serialized to `results/checkpoints/` after every task.
+- If a script crashes, simply restarting it will trigger the self-healing logic, resuming from the last completed task.
 
-### Run 3: RGW Disabled
-- **Active Components**: OGD only (reflexive pass).
-- **Hypothesis**: Maintains knowledge (low BWT) but lacks the reasoning capacity to adapt quickly to new, ambiguous tasks (low ACC/FWT), proving the necessity of the recursive workspace.
+## 🚀 Parallel Launch Instructions
+It is highly recommended to run these scripts on separate GPUs for maximum efficiency:
 
-## Outcome
-The architectural autopsy provides empirical proof that the "magic" of ANTARA lies in the intersection of its reflexive and deliberative mechanisms.
-
-## Usage
-Run the ablation orchestrator:
 ```bash
-python ablation_runner.py
+# Set PYTHONPATH to root before running
+export PYTHONPATH=$PYTHONPATH:.
+
+# Launch Vanguard
+python Phase_IV_Ablation/vanguard_full.py &
+
+# Launch Naive Control
+python Phase_IV_Ablation/naive_control.py &
 ```
+
+## 📊 Outputs
+Results are stored in `./results/`:
+- `gauntlet_[config].png`: Accuracy heatmap.
+- `gauntlet_[config].json`: Serialized Ri,j matrix.
