@@ -1,49 +1,44 @@
-# ANTARA NeurIPS Evaluation Suite: The Architectural Autopsy
+# ANTARA NeurIPS Evaluation Suite: The Strategic Gauntlet
 
 This repository contains the rigorous, mathematically hardened evaluation suite for the **ANTARA (Adaptive Neural Thinking Architecture for Recursive Analysis)** framework. It is designed to meet the extreme empirical standards of NeurIPS peer review.
 
-## 🔬 Overview
-The suite implements a 4-phase gauntlet to validate ANTARA's stability against catastrophic forgetting across non-stationary distributions (Split CIFAR-100). It features **Online EWC (Schwarz et al. 2018)**, **A-GEM (Chaudhry et al. 2019)**, and a **Surgical Logit Masking** engine to prevent softmax fratricide.
+## 🔬 Scientific Objective
+The suite executes an **Architectural Autopsy** to validate the core hypotheses of the ANTARA framework:
+1.  **System-Level Synergy**: Prove that intelligence and stability emerge from the interaction of System 1 (OGD) and System 2 (RGW).
+2.  **Efficiency Superiority**: Demonstrate that ANTARA achieves SOTA retention (BWT > -0.05) with strictly lower compute overhead than projection-based methods like A-GEM.
+3.  **Strict Data Isolation**: Prove stability without the "crutch" of raw data rehearsal.
 
 ## 📂 Project Structure
 - **[Phase I: Curriculum](./Phase_I_Curriculum)**: Deterministic 10-task Partitioning of CIFAR-100.
-- **[Phase II: Baselines](./Phase_II_Baselines)**: Online EWC and A-GEM reference implementations.
-- **[Phase III: Metrics](./Phase_III_Metrics)**: Ri,j Accuracy Matrix, ACC, BWT, and FWT calculation.
-- **[Phase IV: Ablation](./Phase_IV_Ablation)**: The parallel, self-healing Gauntlet orchestrator.
+- **[Phase II: Baselines](./Phase_II_Baselines)**: Standardized EWC, ER, and A-GEM implementations.
+- **[Phase III: Metrics](./Phase_III_Metrics)**: Strategic telemetry tracking (ACC, BWT, FWT, Step Latency, Memory).
+- **[Phase IV: Ablation](./Phase_IV_Ablation)**: Unified branch runner for the 7-branch gauntlet.
 
-## 🚀 Remote Execution Guide
+## 🚀 Execution Guide (Remote Parity)
 
-### 1. Environment Setup
-Clone the repository and install dependencies on your remote compute node:
-```bash
-git clone https://github.com/Ultron09/NeurIPS.git
-cd NeurIPS
-pip install -r requirements.txt
-pip install airborne-antara
-```
-
-### 2. Parallel Gauntlet Launch
-Phase IV is optimized for parallel execution across multiple GPUs. You can launch individual ablation studies simultaneously:
+### 1. Parallel Task Launch
+Phase IV uses a unified runner to ensure exact hyperparameter parity across all branches. Run these in parallel on your compute clusters:
 
 ```bash
 # Node 1: Full Framework
-python Phase_IV_Ablation/vanguard_full.py
+python Phase_IV_Ablation/benchmark_runner.py --method ANTARA_FULL
 
-# Node 2: Stability Ablation
-python Phase_IV_Ablation/ablated_memory.py
+# Node 2: Synergy Ablations
+python Phase_IV_Ablation/benchmark_runner.py --method ANTARA_RGW_ONLY
+python Phase_IV_Ablation/benchmark_runner.py --method ANTARA_OGD_ONLY
 
-# Node 3: Deliberation Ablation
-python Phase_IV_Ablation/ablated_consciousness.py
-
-# Node 4: Baseline Control
-python Phase_IV_Ablation/naive_control.py
+# Node 3: Competitive Baselines
+python Phase_IV_Ablation/benchmark_runner.py --method AGEM
+python Phase_IV_Ablation/benchmark_runner.py --method EWC
+python Phase_IV_Ablation/benchmark_runner.py --method REPLAY
 ```
 
-### 🛡️ Self-Healing Checkpointing
-All Phase IV scripts feature **automatic task-level state recovery**. If a run is interrupted (e.g., spot instance termination), simply re-run the script. It will automatically detect the `results/checkpoints/` directory and resume exactly from the last successfully completed task.
-
-## 📊 Results & Visualization
-All metrics and heatmaps are automatically saved to `Phase_IV_Ablation/results/`. These are formatted for high-resolution placement in a LaTeX NeurIPS manuscript.
+### 📊 Strategic Results Aggregation
+After the branches complete, generate the unified comparison report:
+```bash
+python Phase_IV_Ablation/aggregate_results.py
+```
+This generates `results/final_strategic_report.md`, which contains the publication-ready comparison table.
 
 ---
 **Lead Researchers:** Suryaansh Prithvijit Singh, Sonya Shelke  
