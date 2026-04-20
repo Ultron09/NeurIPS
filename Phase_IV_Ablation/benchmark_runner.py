@@ -20,8 +20,23 @@ def model_factory():
     # Use standard ResNet-18 without pre-training for benchmark purity
     return resnet18(num_classes=100)
 
-def run_experiment(method_name, device='cuda', seed=42):
+def run_experiment(method_name, device='cuda', seed=42, use_wandb=False, 
+                   project_name="NeurIPS", entity_name="ultron09-airbornehrs"):
     print(f"\n[NEURIPS GAUNTLET] Executing Branch: {method_name}")
+    
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project=project_name, 
+            entity=entity_name,
+            name=method_name, 
+            config={
+                "method": method_name,
+                "seed": seed,
+                "device": device
+            }
+        )
+
     set_seed(seed)
     curriculum = SplitCIFAR100()
     model = model_factory().to(device)
@@ -83,8 +98,11 @@ def run_experiment(method_name, device='cuda', seed=42):
             
         os.makedirs("results", exist_ok=True)
         metrics.save_results(f"results/{method_name}_metrics.json")
+        
+        if use_wandb:
+            metrics.sync_to_wandb(t_idx)
 
-    metrics.generate_summary_report() # Assuming implementation in metrics.py
+    metrics.generate_summary_report()
     metrics.plot_heatmap(f"results/{method_name}_heatmap.png")
 
 if __name__ == "__main__":
@@ -94,6 +112,11 @@ if __name__ == "__main__":
     ])
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases live logging")
+    parser.add_argument("--project", type=str, default="NeurIPS")
+    parser.add_argument("--entity", type=str, default="ultron09-airbornehrs")
     args = parser.parse_args()
     
-    run_experiment(args.method, device=args.device, seed=args.seed)
+    run_experiment(args.method, device=args.device, seed=args.seed, 
+                   use_wandb=args.wandb, project_name=args.project, 
+                   entity_name=args.entity)

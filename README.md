@@ -45,6 +45,15 @@ To hit the 10-day deadline, assign the 7 branches to your team members as follow
 1. Every team member must run: `pip install -r requirements.txt`
 2. Run assigned commands: `python Phase_IV_Ablation/benchmark_runner.py --method <ASSIGNED_METHOD>`
 
+#### 🔴 Live Monitoring (Weights & Biases):
+To see the "Live Thing" on your Lead laptop, each team member should run:
+```bash
+pip install wandb
+wandb login
+python Phase_IV_Ablation/benchmark_runner.py --method <ASSIGNED_METHOD> --wandb
+```
+Open your [W&B Dashboard](https://wandb.ai/home) to see the 4-laptop cluster results updating in real-time.
+
 #### Results Synchronization:
 Once runs are complete, send all `.json` files from the `results/` folder to the Lead laptop. Place them in the root `results/` directory and run:
 ```bash

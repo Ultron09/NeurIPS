@@ -1,7 +1,11 @@
-import numpy as np
 import json
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 class MetricsEngine:
     """
@@ -56,6 +60,24 @@ class MetricsEngine:
         }
         with open(path, 'w') as f:
             json.dump(results, f, indent=4)
+
+    def sync_to_wandb(self, task_idx):
+        """Pushes current task metrics to W&B live dashboard."""
+        if wandb and wandb.run:
+            acc = self.calculate_acc()
+            bwt = self.calculate_bwt() if task_idx > 0 else 0.0
+            fwt = self.calculate_fwt() if task_idx > 0 else 0.0
+            
+            wandb.log({
+                "task_idx": task_idx,
+                "current_acc": acc,
+                "bwt": bwt,
+                "fwt": fwt,
+                "avg_step_time_ms": self.avg_step_time_ms,
+                "peak_memory_mb": self.peak_memory_mb,
+                "total_compute_time_sec": self.total_compute_time_sec
+            })
+            print(f"[WANDB] Synced task {task_idx} metrics to cloud dashboard.")
 
     def generate_summary_report(self):
         acc = self.calculate_acc()

@@ -10,3 +10,4 @@ pandas>=2.0.0
 
 # The Package
 airborne-antara
+wandb
