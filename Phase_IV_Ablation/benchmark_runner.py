@@ -48,7 +48,7 @@ def run_experiment(method_name, device='cuda', seed=42):
         ewc_module = EWC(model, lambda_factor=5000)
     elif method_name == "REPLAY":
         replay_buffer = ExperienceReplay(buffer_size=2000)
-    elif method_name == "AGEM":
+    elif method_name == "A-GEM":
         agem_module = AGEM(model, buffer_size=2000)
     elif method_name == "NAIVE":
         pass
@@ -89,6 +89,9 @@ def run_experiment(method_name, device='cuda', seed=42):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--method", type=str, required=True, choices=[
+        "ANTARA_FULL", "ANTARA_RGW_ONLY", "ANTARA_OGD_ONLY", "EWC", "REPLAY", "A-GEM", "NAIVE"
+    ])
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()

@@ -33,6 +33,25 @@ python Phase_IV_Ablation/benchmark_runner.py --method EWC
 python Phase_IV_Ablation/benchmark_runner.py --method REPLAY
 ```
 
+### 2. Distributed Team Workflow (4 Laptops)
+To hit the 10-day deadline, assign the 7 branches to your team members as follows:
+
+- **Laptop 1 (Lead)**: `ANTARA_FULL`
+- **Laptop 2**: `A-GEM`, `NAIVE`
+- **Laptop 3**: `EWC`, `REPLAY`
+- **Laptop 4**: `ANTARA_RGW_ONLY`, `ANTARA_OGD_ONLY`
+
+#### Parity Protocol:
+1. Every team member must run: `pip install -r requirements.txt`
+2. Run assigned commands: `python Phase_IV_Ablation/benchmark_runner.py --method <ASSIGNED_METHOD>`
+
+#### Results Synchronization:
+Once runs are complete, send all `.json` files from the `results/` folder to the Lead laptop. Place them in the root `results/` directory and run:
+```bash
+python Phase_IV_Ablation/aggregate_results.py
+```
+This generates the final `results/final_strategic_report.md`.
+
 ### 📊 Strategic Results Aggregation
 After the branches complete, generate the unified comparison report:
 ```bash
