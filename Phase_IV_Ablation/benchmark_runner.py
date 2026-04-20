@@ -20,9 +20,9 @@ def model_factory():
     # Use standard ResNet-18 without pre-training for benchmark purity
     return resnet18(num_classes=100)
 
-def run_experiment(method_name, device='cuda'):
+def run_experiment(method_name, device='cuda', seed=42):
     print(f"\n[NEURIPS GAUNTLET] Executing Branch: {method_name}")
-    set_seed(42)
+    set_seed(seed)
     curriculum = SplitCIFAR100()
     model = model_factory().to(device)
     metrics = MetricsEngine(config_name=method_name)
@@ -89,9 +89,8 @@ def run_experiment(method_name, device='cuda'):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", type=str, required=True, choices=[
-        "ANTARA_FULL", "ANTARA_RGW_ONLY", "ANTARA_OGD_ONLY", "EWC", "REPLAY", "AGEM", "NAIVE"
-    ])
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     
-    run_experiment(args.method)
+    run_experiment(args.method, device=args.device, seed=args.seed)
