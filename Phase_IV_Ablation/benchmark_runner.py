@@ -70,7 +70,10 @@ def run_experiment(method_name, device='cuda', seed=42, use_wandb=False,
     else:
         raise ValueError("Invalid experiment method")
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.0)
+    # Baselines use a shared external SGD optimizer.
+    # ANTARA manages its own internal AdamW + meta-optimizer + adapter-optimizer.
+    is_antara = method_name.startswith("ANTARA")
+    optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
     # Main Curriculum Loop
     for t_idx in range(10):
