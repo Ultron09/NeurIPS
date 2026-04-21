@@ -16,10 +16,11 @@ class SplitCIFAR100:
     Deterministic Split-CIFAR100 Curriculum.
     Partitions 100 classes into 10 sequential tasks (10 classes each).
     """
-    def __init__(self, root='./data', seed=42, batch_size=64):
+    def __init__(self, root='./data', seed=42, batch_size=64, pin_memory=False):
         self.root = root
         self.seed = seed
         self.batch_size = batch_size
+        self.pin_memory = pin_memory
         set_seed(seed)
         
         # Standard CIFAR-100 Normalization
@@ -58,9 +59,9 @@ class SplitCIFAR100:
         train_idx = train_indices[:split]
         val_idx = train_indices[split:]
         
-        train_loader = DataLoader(Subset(self.train_set, train_idx), batch_size=self.batch_size, shuffle=True)
-        val_loader = DataLoader(Subset(self.train_set, val_idx), batch_size=self.batch_size, shuffle=False)
-        test_loader = DataLoader(Subset(self.test_set, test_indices), batch_size=self.batch_size, shuffle=False)
+        train_loader = DataLoader(Subset(self.train_set, train_idx), batch_size=self.batch_size, shuffle=True, pin_memory=self.pin_memory)
+        val_loader = DataLoader(Subset(self.train_set, val_idx), batch_size=self.batch_size, shuffle=False, pin_memory=self.pin_memory)
+        test_loader = DataLoader(Subset(self.test_set, test_indices), batch_size=self.batch_size, shuffle=False, pin_memory=self.pin_memory)
         
         return train_loader, val_loader, test_loader
 

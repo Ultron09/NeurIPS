@@ -17,13 +17,32 @@ from trainer import train_single_task
 from evaluation import evaluate_suite
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 
+def setup_compute(device_str):
+    """Detect and initialize the best available compute device."""
+    if device_str == "cuda" and not torch.cuda.is_available():
+        print(f"  [SYSTEM] CUDA requested but not found. Falling back to CPU.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(device_str)
+        
+    print(f"  [SYSTEM] Active Compute Device: {device}")
+    
+    if device.type == 'cuda':
+        # Optimize for static input dimensions (CIFAR-100)
+        torch.backends.cudnn.benchmark = True
+        print(f"  [SYSTEM] cuDNN Auto-tuner: ENABLED")
+        
+    return device
+
 def model_factory():
     # Use standard ResNet-18 without pre-training for benchmark purity
     return resnet18(num_classes=100)
 
-def run_experiment(method_name, device='cuda', seed=42, use_wandb=False, 
+def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False, 
                    project_name="NeurIPS", entity_name="ultron09-airbornehrs"):
     print(f"\n[NEURIPS GAUNTLET] Executing Branch: {method_name}")
+    
+    device = setup_compute(device_str)
     
     if use_wandb:
         import wandb
@@ -34,12 +53,16 @@ def run_experiment(method_name, device='cuda', seed=42, use_wandb=False,
             config={
                 "method": method_name,
                 "seed": seed,
-                "device": device
+                "device": str(device)
             }
         )
 
     set_seed(seed)
-    curriculum = SplitCIFAR100()
+    
+    # [OPTIMIZATION] Pin memory only if using CUDA
+    use_pin = (device.type == 'cuda')
+    curriculum = SplitCIFAR100(pin_memory=use_pin)
+    
     model = model_factory().to(device)
     metrics = MetricsEngine(config_name=method_name)
     total_start_time = time.time()
@@ -131,6 +154,10 @@ def run_experiment(method_name, device='cuda', seed=42, use_wandb=False,
         
         if use_wandb:
             metrics.sync_to_wandb(t_idx)
+
+        # [STABILITY] Clear cache between tasks for the "weakest machine" fallback
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
     metrics.generate_summary_report()
     metrics.plot_heatmap(f"results/{method_name}_heatmap.png")
