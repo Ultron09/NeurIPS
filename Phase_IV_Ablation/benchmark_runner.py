@@ -9,10 +9,6 @@ from torchvision.models import resnet18
 for d in ['Phase_I_Curriculum', 'Phase_II_Baselines', 'Phase_III_Metrics']:
     sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), d))
 
-# Ensure local version of airborne_antara is used over installed package
-framework_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'Mirror_mind')
-if os.path.exists(framework_path):
-    sys.path.insert(0, framework_path)
 
 from dataset import SplitCIFAR100, set_seed
 from baselines import EWC, ExperienceReplay, AGEM
