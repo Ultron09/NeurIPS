@@ -11,8 +11,7 @@ CIFAR-100/
 *.pth
 *.pt
 
-# Results & Checkpoints
-results/
+
 Phase_IV_Ablation/results/
 
 # System-specific
