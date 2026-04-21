@@ -174,6 +174,6 @@ if __name__ == "__main__":
     parser.add_argument("--entity", type=str, default="ultron09-airbornehrs")
     args = parser.parse_args()
     
-    run_experiment(args.method, device=args.device, seed=args.seed, 
+    run_experiment(args.method, device_str=args.device, seed=args.seed, 
                    use_wandb=args.wandb, project_name=args.project, 
                    entity_name=args.entity)
