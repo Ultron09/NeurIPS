@@ -5,9 +5,14 @@ import os
 import torch
 from torchvision.models import resnet18
 
-# Path setup to import from other phases
+# Path setup to import from other phases and local framework
 for d in ['Phase_I_Curriculum', 'Phase_II_Baselines', 'Phase_III_Metrics']:
     sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), d))
+
+# Ensure local version of airborne_antara is used over installed package
+framework_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'Mirror_mind')
+if os.path.exists(framework_path):
+    sys.path.insert(0, framework_path)
 
 from dataset import SplitCIFAR100, set_seed
 from baselines import EWC, ExperienceReplay, AGEM
@@ -59,6 +64,7 @@ def run_experiment(method_name, device='cuda', seed=42, use_wandb=False,
             use_moe=True,                # REQUIRED gate: without this, use_hierarchical_moe is ignored
             use_hierarchical_moe=True,   # Activates H-MoE cortex
             use_ogd=True,                # Activates Orthogonal Gradient Descent projection
+            input_dim=3072,              # [FIX] Flattened CIFAR-100 size (3*32*32) for MoE Gating
         )
         model = AdaptiveFramework(model, config=config)
     elif method_name == "ANTARA_RGW_ONLY":
@@ -69,6 +75,7 @@ def run_experiment(method_name, device='cuda', seed=42, use_wandb=False,
             use_moe=True,                # REQUIRED gate
             use_hierarchical_moe=True,
             use_ogd=False,               # OGD disabled — pure ablation
+            input_dim=3072,              # [FIX] Match CIFAR-100
         )
         model = AdaptiveFramework(model, config=config)
     elif method_name == "ANTARA_OGD_ONLY":
@@ -80,6 +87,7 @@ def run_experiment(method_name, device='cuda', seed=42, use_wandb=False,
             use_moe=True,                # REQUIRED gate
             use_hierarchical_moe=True,
             use_ogd=True,                # OGD active — pure ablation
+            input_dim=3072,              # [FIX] Match CIFAR-100
         )
         model = AdaptiveFramework(model, config=config)
     elif method_name == "EWC":
