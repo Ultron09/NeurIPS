@@ -1,7 +1,8 @@
 import copy
 import time
+import torch
+import torch.nn.functional as F
 from tqdm import tqdm
-
 def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device='cuda', 
                       ewc_module=None, agem_module=None, replay_buffer=None,
                       epochs=10, patience=3):

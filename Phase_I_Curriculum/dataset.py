@@ -34,7 +34,13 @@ class SplitCIFAR100:
         # Deterministic class permutation
         self.classes = list(range(100))
         random.shuffle(self.classes)
-        self.task_classes = [self.classes[i:i+10] for i in range(0, 100, 10)]
+        
+        # Remap targets so they fall continuously from 0 to 99 across tasks
+        class_map = {orig: new for new, orig in enumerate(self.classes)}
+        self.train_set.targets = [class_map[t] for t in self.train_set.targets]
+        self.test_set.targets = [class_map[t] for t in self.test_set.targets]
+        
+        self.task_classes = [list(range(i, i+10)) for i in range(0, 100, 10)]
 
     def get_task(self, task_id):
         """Returns loaders for a specific task domain."""

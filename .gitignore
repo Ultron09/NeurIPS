@@ -22,3 +22,6 @@ venv/
 .env
 .ipynb_checkpoints/
 .DS_Store
+# Telemetry
+wandb/
+tea_debug.log
