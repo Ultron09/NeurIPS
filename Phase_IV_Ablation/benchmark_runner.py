@@ -81,7 +81,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         # Full framework: H-MoE + Consciousness (RGW) + Hybrid Memory (EWC+SI) + Graph Memory (OGD)
         config = AdaptiveFrameworkConfig(
             enable_consciousness=True,   # Activates RGW (Retrograde Gating Weighting)
-            memory_type='hybrid',        # Valid: 'si','ewc','hybrid','none'. Was wrongly 'graph'.
+            importance_method='hybrid',   # [V9.4] Corrected field name
             use_graph_memory=True,       # Graph memory is a flag, NOT a memory_type value
             use_moe=True,                # REQUIRED gate: without this, use_hierarchical_moe is ignored
             use_hierarchical_moe=True,   # Activates H-MoE cortex
@@ -93,7 +93,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         # Ablation: Only Consciousness (RGW) active. Memory/OGD disabled.
         config = AdaptiveFrameworkConfig(
             enable_consciousness=True,   # RGW active
-            memory_type='none',          # Memory disabled — isolates RGW contribution
+            importance_method='none',    # [V9.4] Corrected field name
             use_moe=True,                # REQUIRED gate
             use_hierarchical_moe=True,
             use_ogd=False,               # OGD disabled — pure ablation
@@ -104,7 +104,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         # Ablation: Only OGD+Memory active. Consciousness disabled.
         config = AdaptiveFrameworkConfig(
             enable_consciousness=False,  # RGW disabled — isolates OGD contribution
-            memory_type='hybrid',        # Valid memory. Was wrongly 'graph'.
+            importance_method='hybrid',  # [V9.4] Corrected field name
             use_graph_memory=False,
             use_moe=True,                # REQUIRED gate
             use_hierarchical_moe=True,
