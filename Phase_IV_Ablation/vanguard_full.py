@@ -13,6 +13,7 @@ if __name__ == "__main__":
         memory_type='graph',
         use_hierarchical_moe=True,
         enable_health_monitor=True,
+        health_check_interval=100,
         use_ogd=True,
         ogd_max_basis_size=256,
         ewc_lambda=1000
