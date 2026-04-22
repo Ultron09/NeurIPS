@@ -89,8 +89,7 @@ class AblationOrchestrator:
                 model.train_step(
                     x, 
                     target_data=y, 
-                    start_cls=start_cls, 
-                    end_cls=end_cls
+                    task_id=t_idx
                 )
 
             val_loss = self.validate(t_idx, model, val_loader)
