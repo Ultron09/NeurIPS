@@ -110,17 +110,14 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
             total_step_time += (time.time() - start_time) * 1000  # to ms
             total_steps += 1
 
-        # --- VALIDATION WITH EARLY STOPPING ---
+        # [V9.2] Validation: Periodic check but NO early stopping
+        # This keeps the training schedule fixed for scientifically sound comparison.
         val_loss = validate(model, val_loader, seen_classes, device, is_antara=is_antara)
         if val_loss < best_loss:
             best_loss = val_loss
             best_model = copy.deepcopy(model.state_dict())
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                break
-
+            
+    # Always restore best model weights before consolidation
     model.load_state_dict(best_model)
 
     # --- POST-TASK ANTARA MEMORY CONSOLIDATION ---

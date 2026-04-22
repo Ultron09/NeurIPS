@@ -39,8 +39,10 @@ def model_factory():
     return resnet18(num_classes=100)
 
 def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False, 
-                   project_name="NeurIPS", entity_name="ultron09-airbornehrs"):
-    print(f"\n[NEURIPS GAUNTLET] Executing Branch: {method_name}")
+                   project_name="NeurIPS", entity_name="ultron09-airbornehrs",
+                   suffix=""):
+    full_method_name = f"{method_name}{suffix}"
+    print(f"\n[NEURIPS GAUNTLET] Executing Branch: {full_method_name}")
     
     device = setup_compute(device_str)
     
@@ -49,9 +51,10 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         wandb.init(
             project=project_name, 
             entity=entity_name,
-            name=method_name, 
+            name=full_method_name, 
             config={
-                "method": method_name,
+                "method": full_method_name,
+                "base_method": method_name,
                 "seed": seed,
                 "device": str(device)
             }
@@ -64,7 +67,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
     curriculum = SplitCIFAR100(pin_memory=use_pin)
     
     model = model_factory().to(device)
-    metrics = MetricsEngine(config_name=method_name)
+    metrics = MetricsEngine(config_name=full_method_name)
     total_start_time = time.time()
     task_step_times = []
     
@@ -120,6 +123,18 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
     else:
         raise ValueError("Invalid experiment method")
 
+    # [LOG] Register hyperparameters for paper discussion
+    from hparams_registry import registry
+    hparams = config if config else {
+        "ewc_lambda": 5000 if method_name == "EWC" else None,
+        "replay_buffer_size": 2000 if method_name == "REPLAY" else None,
+        "agem_buffer_size": 2000 if method_name == "A-GEM" else None,
+        "optimizer": "SGD",
+        "lr": 0.01,
+        "momentum": 0.9
+    }
+    registry.log_experiment(method_name, hparams)
+
     # Baselines use a shared external SGD optimizer.
     # ANTARA manages its own internal AdamW + meta-optimizer + adapter-optimizer.
     is_antara = method_name.startswith("ANTARA")
@@ -133,7 +148,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         avg_step_time = train_single_task(model, train_loader, val_loader, optimizer, t_idx, 
                                           device=device, ewc_module=ewc_module, 
                                           agem_module=agem_module, replay_buffer=replay_buffer,
-                                          epochs=50)
+                                          epochs=10)
         task_step_times.append(avg_step_time)
         
         # Post-task anchoring
@@ -150,7 +165,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
             metrics.peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
             
         os.makedirs("results", exist_ok=True)
-        metrics.save_results(f"results/{method_name}_metrics.json")
+        metrics.save_results(f"results/{full_method_name}_metrics.json")
         
         if use_wandb:
             metrics.sync_to_wandb(t_idx)
@@ -160,7 +175,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
             torch.cuda.empty_cache()
 
     metrics.generate_summary_report()
-    metrics.plot_heatmap(f"results/{method_name}_heatmap.png")
+    metrics.plot_heatmap(f"results/{full_method_name}_heatmap.png")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -172,8 +187,9 @@ if __name__ == "__main__":
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases live logging")
     parser.add_argument("--project", type=str, default="NeurIPS")
     parser.add_argument("--entity", type=str, default="ultron09-airbornehrs")
+    parser.add_argument("--suffix", type=str, default="", help="Suffix to append to method name (e.g. _v2)")
     args = parser.parse_args()
     
     run_experiment(args.method, device_str=args.device, seed=args.seed, 
                    use_wandb=args.wandb, project_name=args.project, 
-                   entity_name=args.entity)
+                   entity_name=args.entity, suffix=args.suffix)
