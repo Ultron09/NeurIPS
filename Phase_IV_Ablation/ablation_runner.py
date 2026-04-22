@@ -48,18 +48,16 @@ class AblationOrchestrator:
             "meta": f"{base}_meta.json"
         }
 
-    def save_checkpoint(self, t_idx, model, metrics_engine, ewc_module=None):
+    def save_checkpoint(self, t_idx, model, metrics_engine):
         paths = self.get_checkpoint_paths()
         torch.save(model.state_dict(), paths["model"])
         metrics_engine.save_state(paths["metrics"])
-        if ewc_module:
-            torch.save(ewc_module.state_dict(), paths["ewc"])
         
         with open(paths["meta"], 'w') as f:
             json.dump({"last_completed_task": t_idx}, f)
         print(f"  [Self-Healing] Checkpoint saved for Task {t_idx+1}")
 
-    def load_checkpoint(self, model, metrics_engine, ewc_module=None):
+    def load_checkpoint(self, model, metrics_engine):
         paths = self.get_checkpoint_paths()
         if os.path.exists(paths["meta"]):
             with open(paths["meta"], 'r') as f:
@@ -68,14 +66,12 @@ class AblationOrchestrator:
             
             model.load_state_dict(torch.load(paths["model"], map_location=self.device))
             metrics_engine.load_state(paths["metrics"])
-            if ewc_module and os.path.exists(paths["ewc"]):
-                ewc_module.load_state_dict(torch.load(paths["ewc"], map_location=self.device))
             
             print(f"  [Self-Healing] Resuming from Task {last_task + 2} (Last completed: {last_task+1})")
             return last_task + 1
         return 0
 
-    def train_one_task(self, t_idx, model, train_loader, val_loader, optimizer, ewc_module=None):
+    def train_one_task(self, t_idx, model, train_loader, val_loader):
         best_val_loss = float('inf')
         epochs_no_improve = 0
         best_model_state = copy.deepcopy(model.state_dict())
@@ -84,14 +80,18 @@ class AblationOrchestrator:
         print(f"  Training for Task {t_idx+1} | Epochs: {self.epochs}")
         for epoch in range(self.epochs):
             model.train()
+            # Use progress bar logic if useful, else keep it simple
             for x, y in train_loader:
                 x, y = x.to(self.device), y.to(self.device)
-                optimizer.zero_grad()
-                logits = model(x)
-                loss = F.cross_entropy(logits[:, start_cls:end_cls], y - start_cls)
-                if ewc_module: loss += ewc_module.penalty()
-                loss.backward()
-                optimizer.step()
+                
+                # [PHASE IV HARDENING] Use framework train_step instead of manual logic
+                # This activates OGD, Consciousness, and Autonomic Health.
+                model.train_step(
+                    x, 
+                    target_data=y, 
+                    start_cls=start_cls, 
+                    end_cls=end_cls
+                )
 
             val_loss = self.validate(t_idx, model, val_loader)
             if val_loss < best_val_loss:
@@ -119,16 +119,16 @@ class AblationOrchestrator:
         metrics_engine = MetricsEngine(num_tasks=10, classes_per_task=10, config_name=self.config_name)
         backbone = self.model_factory().to(self.device)
         agent = AdaptiveFramework(backbone, config=config)
-        optimizer = torch.optim.SGD(agent.parameters(), lr=0.01, momentum=0.0)
-        ewc = EWC(agent, gamma=1.0) if config.ewc_lambda > 0 else None
+        
+        # [PHASE IV HARDENING] Agent handles its own optimization internally.
+        # We no longer pass an external optimizer or EWC module.
 
-        start_task = self.load_checkpoint(agent, metrics_engine, ewc)
+        start_task = self.load_checkpoint(agent, metrics_engine)
         
         for t_idx in range(start_task, 10):
             print(f"--- Task {t_idx+1}/10 ---")
             train_loader, val_loader, _ = self.curriculum.get_task(t_idx)
-            self.train_one_task(t_idx, agent, train_loader, val_loader, optimizer, ewc)
-            if ewc: ewc.save_task_weights(train_loader)
+            self.train_one_task(t_idx, agent, train_loader, val_loader)
             
             # Evaluate all tasks after training
             for eval_idx in range(10):
@@ -137,7 +137,7 @@ class AblationOrchestrator:
                 acc = self.evaluate(agent, test_loader, t_idx if mode == 'class-il' else eval_idx, mode=mode)
                 metrics_engine.update_result(t_idx, eval_idx, acc)
             
-            self.save_checkpoint(t_idx, agent, metrics_engine, ewc)
+            self.save_checkpoint(t_idx, agent, metrics_engine)
 
         metrics_engine.generate_report()
         metrics_engine.plot_heatmap(filename=os.path.join(ROOT_DIR, 'Phase_IV_Ablation', 'results', f"final_{self.config_name}.png"))
