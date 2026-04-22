@@ -48,6 +48,13 @@ class AblationOrchestrator:
             "meta": f"{base}_meta.json"
         }
 
+            model.load_state_dict(torch.load(paths["model"], map_location=self.device))
+            metrics_engine.load_state(paths["metrics"])
+            
+            print(f"  [Self-Healing] Resuming from Task {last_task + 2} (Last completed: {last_task+1})")
+            return last_task + 1
+        return 0
+    
     def save_checkpoint(self, t_idx, model, metrics_engine):
         paths = self.get_checkpoint_paths()
         torch.save(model.state_dict(), paths["model"])
@@ -63,13 +70,6 @@ class AblationOrchestrator:
             with open(paths["meta"], 'r') as f:
                 meta = json.load(f)
             last_task = meta["last_completed_task"]
-            
-            model.load_state_dict(torch.load(paths["model"], map_location=self.device))
-            metrics_engine.load_state(paths["metrics"])
-            
-            print(f"  [Self-Healing] Resuming from Task {last_task + 2} (Last completed: {last_task+1})")
-            return last_task + 1
-        return 0
 
     def train_one_task(self, t_idx, model, train_loader, val_loader):
         best_val_loss = float('inf')
