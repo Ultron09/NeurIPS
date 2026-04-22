@@ -182,5 +182,41 @@
             "health_check_interval": 20,
             "enable_performance_monitor": false
         }
+    },
+    {
+        "method": "EWC",
+        "timestamp": "2026-04-22T08:07:17.096514",
+        "config": {
+            "ewc_lambda": 5000,
+            "replay_buffer_size": null,
+            "agem_buffer_size": null,
+            "optimizer": "SGD",
+            "lr": 0.01,
+            "momentum": 0.9
+        }
+    },
+    {
+        "method": "REPLAY",
+        "timestamp": "2026-04-22T08:07:33.119580",
+        "config": {
+            "ewc_lambda": null,
+            "replay_buffer_size": 2000,
+            "agem_buffer_size": null,
+            "optimizer": "SGD",
+            "lr": 0.01,
+            "momentum": 0.9
+        }
+    },
+    {
+        "method": "NAIVE",
+        "timestamp": "2026-04-22T08:07:44.142349",
+        "config": {
+            "ewc_lambda": null,
+            "replay_buffer_size": null,
+            "agem_buffer_size": null,
+            "optimizer": "SGD",
+            "lr": 0.01,
+            "momentum": 0.9
+        }
     }
 ]
