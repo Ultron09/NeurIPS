@@ -137,33 +137,25 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     self_mem.saturation_level = total_sacred / num_total
                     print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
 
-        # [V9.4] Cognitive Brain Surgery (Full-Context Memory)
+        # [V9.4] Knowledge Anchoring Patch
         import types
-        from airborne_antara.memory import UnifiedMemoryHandler
-        model.memory = UnifiedMemoryHandler(
-            models=[model], 
-            method=getattr(config, 'memory_type', 'hybrid'),
-            si_lambda=getattr(config, 'si_lambda', 1.0),
-            ewc_lambda=getattr(config, 'ewc_lambda', 0.4),
-            use_ogd=getattr(config, 'use_ogd', False),
-            feature_dim=config.model_dim
-        )
         model.memory._update_sacred_core = types.MethodType(patched_update_sacred_core, model.memory)
-        print(f"  [BRAIN] Full-Context Memory Protocol Engaged. Tracking {len(list(model.parameters()))} parameters.")
-        
+        print(f"  [BRAIN] Unified Memory Protection Engaged. Tracking {len(model.memory.models)} modules.")
+
         # [V9.4 HARDENING] Inject Gradient Sentinel Hooks
-        # Since the library fails to apply its own mask, we force it via PyTorch autograd hooks.
         def get_sentinel_hook(p_name, mem_obj):
             def hook(grad):
                 if p_name in mem_obj.sacred_mask:
                     mask = mem_obj.sacred_mask[p_name].to(grad.device)
+                    # Surgical gradient shunting
                     return grad * (~mask)
                 return grad
             return hook
 
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                p.register_hook(get_sentinel_hook(name, model.memory))
+        for tracked_model in model.memory.models:
+            for name, p in tracked_model.named_parameters():
+                if p.requires_grad:
+                    p.register_hook(get_sentinel_hook(name, model.memory))
         
         print("  [SYSTEM] Full-Spectrum Gradient Sentinel Hooks successfully attached.")
 
