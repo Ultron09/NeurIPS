@@ -81,7 +81,15 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                 else:
                     logits = model(x)
 
-                loss = F.cross_entropy(logits[:, :seen_classes], y)
+                # [V9.4] Task-Adaptive Logit Masking (NeurIPS Killshot)
+                # Ensure the loss only focuses on current task classes to prevent 
+                # aggressive suppression of past task knowledge.
+                start_cls = t_idx * 10
+                end_cls = (t_idx + 1) * 10
+                task_logits = logits[:, start_cls:end_cls]
+                task_y = y % 10 # Map [10-19] to [0-9]
+                
+                loss = F.cross_entropy(task_logits, task_y)
 
                 # --- HAT REGULARIZATION ---
                 if hat_module:

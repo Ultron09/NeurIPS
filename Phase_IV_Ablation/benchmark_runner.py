@@ -137,8 +137,18 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     self_mem.saturation_level = total_sacred / num_total
                     print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
 
-        import types
+        # [V9.4] Cognitive Brain Surgery (Full-Context Memory)
+        from airborne_antara.memory import UnifiedMemoryHandler
+        model.memory = UnifiedMemoryHandler(
+            models=[model], 
+            method=getattr(config, 'memory_type', 'hybrid'),
+            si_lambda=getattr(config, 'si_lambda', 1.0),
+            ewc_lambda=getattr(config, 'ewc_lambda', 0.4),
+            use_ogd=getattr(config, 'use_ogd', False),
+            feature_dim=config.model_dim
+        )
         model.memory._update_sacred_core = types.MethodType(patched_update_sacred_core, model.memory)
+        print(f"  [BRAIN] Full-Context Memory Protocol Engaged. Tracking {len(list(model.parameters()))} parameters.")
         
         # [V9.4 HARDENING] Inject Gradient Sentinel Hooks
         # Since the library fails to apply its own mask, we force it via PyTorch autograd hooks.
@@ -150,12 +160,11 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                 return grad
             return hook
 
-        for tracked_model in model.memory.models:
-            for name, p in tracked_model.named_parameters():
-                if p.requires_grad:
-                    p.register_hook(get_sentinel_hook(name, model.memory))
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                p.register_hook(get_sentinel_hook(name, model.memory))
         
-        print("  [SYSTEM] Gradient Sentinel Hooks successfully attached to Neural Architecture.")
+        print("  [SYSTEM] Full-Spectrum Gradient Sentinel Hooks successfully attached.")
 
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     metrics = MetricsEngine(num_tasks=10, config_name=full_method_name)
