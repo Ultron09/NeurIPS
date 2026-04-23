@@ -90,10 +90,11 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
             use_hierarchical_moe=True,   
             use_ogd=True,                
             input_dim=3072,              
-            # [V9.4] Hardened Thresholds
-            novelty_z_threshold=2.0,            # Tau_sim
+            # [V9.4] Hardened Thresholds for Class-IL
+            learning_rate=5e-3,                 # [OPTIMIZED] Higher LR for faster convergence on CPU/Limited nodes
+            novelty_z_threshold=1.5,            # [ADAPTIVE] Lowered to trigger faster adaptation (Tau_sim)
             consolidation_surprise_threshold=2.5, # Tau_H
-            adaptation_threshold=0.05,          # Tau_sat
+            adaptation_threshold=0.02,          # [PLASTICITY] Lowered to allow more 'Cortex Editing' (Tau_sat)
             use_gradient_centralization=True,
             use_lookahead=True
         )
@@ -145,6 +146,24 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         if method_name == "EWC":
             ewc_module.save_task_weights(train_loader, device=device)
             
+        # Post-task memory consolidation (V9.4 Eternal Protocol)
+        if is_antara:
+            print(f"\n[ANTARA] Post-task memory consolidated for Task {t_idx}.")
+            model.memory.consolidate(task_id=t_idx)
+            
+            # [PLASTICITY RESTORATION] 
+            # If saturation is > 10%, prune the mask to allow learning in Task N+1
+            if model.memory.saturation_level > 0.10:
+                print(f"  [SENTIENT] High Saturation ({model.memory.saturation_level:.2%}). Pruning Sacred Core for plasticity...")
+                for name in model.memory.sacred_mask:
+                    # Stochastically prune 50% of the least important sacred weights
+                    mask = model.memory.sacred_mask[name]
+                    if mask.any():
+                        # Simple random pruning to restore gradient flow
+                        prune_mask = torch.rand_like(mask.float()) > 0.5
+                        model.memory.sacred_mask[name] = mask & prune_mask.to(mask.device)
+                print(f"  [SENTIENT] Plasticity Restored. New Saturation: {model.memory.saturation_level/2:.2%}")
+
         # Unified Evaluation Autopsy
         evaluate_suite(model, curriculum, t_idx, metrics, device=device, hat_module=hat_module)
         

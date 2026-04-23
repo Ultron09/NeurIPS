@@ -92,8 +92,6 @@
         }
     },
     {
-<<<<<<< Updated upstream
-<<<<<<< HEAD
         "method": "DER++",
         "timestamp": "2026-04-23T13:46:00.868632",
         "config": {
@@ -101,7 +99,12 @@
             "replay_buffer_size": null,
             "agem_buffer_size": null,
             "der_alpha": 0.1,
-=======
+            "hat_reg": null,
+            "optimizer": "SGD",
+            "lr": 0.01
+        }
+    },
+    {
         "method": "A-GEM",
         "timestamp": "2026-04-23T13:58:59.768211",
         "config": {
@@ -109,8 +112,12 @@
             "replay_buffer_size": null,
             "agem_buffer_size": 2000,
             "der_alpha": null,
->>>>>>> 35dded7d5c06e8db33945e969de2cfd907c8a5b3
-=======
+            "hat_reg": null,
+            "optimizer": "SGD",
+            "lr": 0.01
+        }
+    },
+    {
         "method": "EWC",
         "timestamp": "2026-04-23T15:28:08.486083",
         "config": {
@@ -118,17 +125,14 @@
             "replay_buffer_size": null,
             "agem_buffer_size": null,
             "der_alpha": null,
->>>>>>> Stashed changes
             "hat_reg": null,
             "optimizer": "SGD",
             "lr": 0.01
         }
-<<<<<<< Updated upstream
-<<<<<<< HEAD
     },
     {
-        "method": "HAT",
-        "timestamp": "2026-04-23T15:09:53.799540",
+        "method": "HAT_V3_seed42",
+        "timestamp": "2026-04-23T15:23:13.696626",
         "config": {
             "ewc_lambda": null,
             "replay_buffer_size": null,
@@ -138,9 +142,5 @@
             "optimizer": "SGD",
             "lr": 0.01
         }
-=======
->>>>>>> 35dded7d5c06e8db33945e969de2cfd907c8a5b3
-=======
->>>>>>> Stashed changes
     }
 ]

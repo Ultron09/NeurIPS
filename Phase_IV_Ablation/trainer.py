@@ -148,19 +148,6 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
     # Always restore best model weights before consolidation
     model.load_state_dict(best_model)
 
-    # --- POST-TASK ANTARA MEMORY CONSOLIDATION ---
-    if is_antara:
-        try:
-            model.consolidate_memory(
-                feedback_buffer=model.feedback_buffer,
-                current_step=getattr(model, 'step_count', 0),
-                z_score=2.5,
-                mode='NORMAL'
-            )
-            print(f"  [ANTARA] Post-task memory consolidated for Task {t_idx}.")
-        except Exception as e:
-            print(f"  [ANTARA] Consolidation warning: {e}")
-
     avg_step_time = total_step_time / total_steps if total_steps > 0 else 0
     return avg_step_time
 
