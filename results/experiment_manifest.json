@@ -92,6 +92,7 @@
         }
     },
     {
+<<<<<<< Updated upstream
 <<<<<<< HEAD
         "method": "DER++",
         "timestamp": "2026-04-23T13:46:00.868632",
@@ -109,10 +110,20 @@
             "agem_buffer_size": 2000,
             "der_alpha": null,
 >>>>>>> 35dded7d5c06e8db33945e969de2cfd907c8a5b3
+=======
+        "method": "EWC",
+        "timestamp": "2026-04-23T15:28:08.486083",
+        "config": {
+            "ewc_lambda": 5000,
+            "replay_buffer_size": null,
+            "agem_buffer_size": null,
+            "der_alpha": null,
+>>>>>>> Stashed changes
             "hat_reg": null,
             "optimizer": "SGD",
             "lr": 0.01
         }
+<<<<<<< Updated upstream
 <<<<<<< HEAD
     },
     {
@@ -129,5 +140,7 @@
         }
 =======
 >>>>>>> 35dded7d5c06e8db33945e969de2cfd907c8a5b3
+=======
+>>>>>>> Stashed changes
     }
 ]
