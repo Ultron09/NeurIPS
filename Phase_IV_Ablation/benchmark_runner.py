@@ -138,23 +138,26 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
 
         # [V9.4] Knowledge Anchoring Patch
-        import types
-        model.memory._update_sacred_core = types.MethodType(patched_update_sacred_core, model.memory)
-        print(f"  [BRAIN] Unified Memory Protection Engaged. Tracking {len(model.memory.models)} modules.")
+        # [V9.4] Live Protection Registry
+        model.memory.param_id_to_mask = {}
 
-        # [V9.4 HARDENING] Inject Hash-Locked Gradient Sentinel Hooks
-        # This resolves the 'Naming Schism' where experts have different names for the same shared backbone.
-        param_to_mask = {}
-        for name, p in model.named_parameters():
-            if name in model.memory.sacred_mask:
-                param_to_mask[id(p)] = model.memory.sacred_mask[name]
+        # Re-inject the anchoring patch to also update the ID-map
+        original_update = patched_update_sacred_core
+        def dynamic_id_update(self_mem, importance_dict):
+            original_update(self_mem, importance_dict)
+            # Update the ID-based map from the newly anchored names
+            for name, p in model.named_parameters():
+                if name in self_mem.sacred_mask:
+                    self_mem.param_id_to_mask[id(p)] = self_mem.sacred_mask[name]
 
-        def get_id_sentinel_hook(p_obj):
+        model.memory._update_sacred_core = types.MethodType(dynamic_id_update, model.memory)
+
+        def get_id_sentinel_hook(p_obj, mem_obj):
             p_id = id(p_obj)
             def hook(grad):
-                if p_id in param_to_mask:
-                    mask = param_to_mask[p_id].to(grad.device)
-                    # Surgical gradient shunting: 0 gradients for sacred weights
+                if p_id in mem_obj.param_id_to_mask:
+                    mask = mem_obj.param_id_to_mask[p_id].to(grad.device)
+                    # Surgical gradient shunting
                     return grad * (~mask)
                 return grad
             return hook
@@ -164,10 +167,10 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         for tracked_model in model.memory.models:
             for p in tracked_model.parameters():
                 if p.requires_grad:
-                    p.register_hook(get_id_sentinel_hook(p))
+                    p.register_hook(get_id_sentinel_hook(p, model.memory))
                     hook_count += 1
         
-        print(f"  [SYSTEM] {hook_count} Hash-Locked Sentinel Hooks successfully attached.")
+        print(f"  [SYSTEM] {hook_count} Dynamic Sentinel Hooks successfully attached.")
 
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     metrics = MetricsEngine(num_tasks=10, config_name=full_method_name)
