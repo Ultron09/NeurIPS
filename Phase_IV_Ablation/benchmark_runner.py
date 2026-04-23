@@ -167,7 +167,16 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         
     # Finalize
     total_duration = time.time() - total_start_time
-    metrics.save_metrics(suffix=suffix)
+    metrics.avg_step_time_ms = (sum(task_step_times)/len(task_step_times)) * 1000
+    metrics.total_compute_time_sec = total_duration
+    if device.type == "cuda":
+        metrics.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        
+    results_path = f"results/{full_method_name}_metrics.json"
+    metrics.save_results(results_path)
+    metrics.plot_heatmap(f"results/{full_method_name}_heatmap.png")
+    metrics.generate_summary_report()
+    
     print(f"\n[GAUNTLET COMPLETE] Method: {full_method_name}")
     print(f"  Total Duration: {total_duration/60:.2f} minutes")
     print(f"  Avg Step Time: {sum(task_step_times)/len(task_step_times):.4f}s")
