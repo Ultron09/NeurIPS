@@ -73,13 +73,13 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         )
         model = AdaptiveFramework(model, config=config, device=device)
     elif method_name == "EWC":
-        ewc_module = EWC(model, ewc_lambda=5000)
+        ewc_module = EWC(model, lambda_factor=5000)
     elif method_name == "REPLAY":
-        replay_buffer = ExperienceReplay(capacity=2000)
+        replay_buffer = ExperienceReplay(buffer_size=2000)
     elif method_name == "A-GEM":
-        agem_module = AGEM(model, capacity=2000, device=device)
+        agem_module = AGEM(model, buffer_size=2000)
     elif method_name == "DER++":
-        der_module = DERPlus(model, capacity=2000, alpha=0.1, device=device)
+        der_module = DERPlus(model, buffer_size=2000, alpha=0.1)
     elif method_name == "HAT":
         hat_module = HAT(model, num_tasks=10).to(device)
     elif method_name == "NAIVE":
