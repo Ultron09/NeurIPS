@@ -138,6 +138,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
 
         # [V9.4] Cognitive Brain Surgery (Full-Context Memory)
+        import types
         from airborne_antara.memory import UnifiedMemoryHandler
         model.memory = UnifiedMemoryHandler(
             models=[model], 
