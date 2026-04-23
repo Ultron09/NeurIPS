@@ -90,5 +90,18 @@
             "health_check_interval": 100,
             "enable_performance_monitor": false
         }
+    },
+    {
+        "method": "A-GEM",
+        "timestamp": "2026-04-23T13:58:59.768211",
+        "config": {
+            "ewc_lambda": null,
+            "replay_buffer_size": null,
+            "agem_buffer_size": 2000,
+            "der_alpha": null,
+            "hat_reg": null,
+            "optimizer": "SGD",
+            "lr": 0.01
+        }
     }
 ]
