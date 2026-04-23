@@ -3,12 +3,12 @@ import time
 import sys
 import os
 import torch
+import copy
 from torchvision.models import resnet18
 
 # Path setup to import from other phases and local framework
 for d in ['Phase_I_Curriculum', 'Phase_II_Baselines', 'Phase_III_Metrics']:
     sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), d))
-
 
 from dataset import SplitCIFAR100, set_seed
 from baselines import EWC, ExperienceReplay, AGEM, DERPlus, HAT
@@ -18,117 +18,118 @@ from evaluation import evaluate_suite
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 
 def setup_compute(device_str):
-    """Detect and initialize the best available compute device."""
-    if device_str == "cuda" and not torch.cuda.is_available():
-        print(f"  [SYSTEM] CUDA requested but not found. Falling back to CPU.")
-        device = torch.device("cpu")
-    else:
-        device = torch.device(device_str)
-        
+    if device_str == "cuda" and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS", entity=None, suffix="", seed=42):
+    set_seed(seed)
+    device = setup_compute(device_str)
+    full_method_name = f"{method_name}{suffix}_seed{seed}"
+    
+    print(f"\n[NEURIPS GAUNTLET] Executing Branch: {full_method_name}")
     print(f"  [SYSTEM] Active Compute Device: {device}")
     
-    if device.type == 'cuda':
-        # Optimize for static input dimensions (CIFAR-100)
-        torch.backends.cudnn.benchmark = True
-        print(f"  [SYSTEM] cuDNN Auto-tuner: ENABLED")
-        
-    return device
-
-def model_factory():
-    # Use standard ResNet-18 without pre-training for benchmark purity
-    return resnet18(num_classes=100)
-
-def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False, 
-                   project_name="NeurIPS", entity_name="ultron09-airbornehrs",
-                   suffix=""):
-    full_method_name = f"{method_name}{suffix}_seed{seed}"
-    print(f"\n[NEURIPS GAUNTLET] Executing Branch: {full_method_name}")
-    
-    device = setup_compute(device_str)
-    
-    if use_wandb:
+    if wandb_sync:
         import wandb
-        wandb.init(
-            project=project_name, 
-            entity=entity_name,
-            name=full_method_name, 
-            config={
-                "method": full_method_name,
-                "base_method": method_name,
-                "seed": seed,
-                "device": str(device)
-            }
-        )
+        wandb.init(project=project, entity=entity, name=full_method_name, config={
+            "method": method_name,
+            "seed": seed,
+            "device": str(device)
+        })
 
-    set_seed(seed)
-    
-    # [OPTIMIZATION] Pin memory only if using CUDA
-    use_pin = (device.type == 'cuda')
-    curriculum = SplitCIFAR100(pin_memory=use_pin)
-    
+    # Initialize model and components
+    def model_factory():
+        return resnet18(num_classes=100)
+        
+    curriculum = SplitCIFAR100(pin_memory=(device.type == "cuda"))
     model = model_factory().to(device)
-    metrics = MetricsEngine(config_name=full_method_name)
-    total_start_time = time.time()
-    task_step_times = []
     
     # Branch config
     ewc_module = None
-    agem_module = None
     replay_buffer = None
+    agem_module = None
     der_module = None
     hat_module = None
     config = None
-    
+
     if method_name == "ANTARA_FULL":
-        # Full framework: H-MoE + Consciousness (RGW) + Joint Saliency Masking
         config = AdaptiveFrameworkConfig(
-            enable_consciousness=True,   
-            importance_method='hybrid',   
-            use_graph_memory=True,       
-            enable_world_model=True,     
-            use_moe=True,                
+            model_dim=256,
+            num_experts=4,
+            top_k_experts=2,
+            use_moe=True,
             use_hierarchical_moe=True,   
             use_ogd=True,                
             input_dim=3072,              
             # [V9.4] Hardened Thresholds for Class-IL
-            learning_rate=5e-3,                 # [OPTIMIZED] Higher LR for faster convergence on CPU/Limited nodes
-            novelty_z_threshold=1.5,            # [ADAPTIVE] Lowered to trigger faster adaptation (Tau_sim)
-            consolidation_surprise_threshold=2.5, # Tau_H
-            adaptation_threshold=0.02,          # [PLASTICITY] Lowered to allow more 'Cortex Editing' (Tau_sat)
+            learning_rate=5e-3,                 
+            novelty_z_threshold=1.5,            
+            consolidation_surprise_threshold=2.5, 
+            adaptation_threshold=0.02,          
             use_gradient_centralization=True,
             use_lookahead=True
         )
-        model = AdaptiveFramework(model, config=config)
+        model = AdaptiveFramework(model, config=config, device=device)
     elif method_name == "EWC":
-        ewc_module = EWC(model, lambda_factor=5000)
+        ewc_module = EWC(model, ewc_lambda=5000)
     elif method_name == "REPLAY":
-        replay_buffer = ExperienceReplay(buffer_size=2000)
+        replay_buffer = ExperienceReplay(capacity=2000)
     elif method_name == "A-GEM":
-        agem_module = AGEM(model, buffer_size=2000)
+        agem_module = AGEM(model, capacity=2000, device=device)
     elif method_name == "DER++":
-        der_module = DERPlus(model, buffer_size=2000)
+        der_module = DERPlus(model, capacity=2000, alpha=0.1, device=device)
     elif method_name == "HAT":
         hat_module = HAT(model, num_tasks=10).to(device)
     elif method_name == "NAIVE":
         pass
     else:
-        raise ValueError("Invalid experiment method")
-
-    # [LOG] Register hyperparameters for paper discussion
-    from hparams_registry import registry
-    hparams = config if config else {
-        "ewc_lambda": 5000 if method_name == "EWC" else None,
-        "replay_buffer_size": 2000 if method_name == "REPLAY" else None,
-        "agem_buffer_size": 2000 if method_name == "A-GEM" else None,
-        "der_alpha": 0.1 if method_name == "DER++" else None,
-        "hat_reg": 0.75 if method_name == "HAT" else None,
-        "optimizer": "SGD",
-        "lr": 0.01
-    }
-    registry.log_experiment(full_method_name, hparams)
+        raise ValueError(f"Invalid experiment method: {method_name}")
 
     is_antara = method_name.startswith("ANTARA")
+    
+    # [MONKEY-PATCH] Fix the 100% Saturation Bug in V9.4
+    if is_antara:
+        def patched_update_sacred_core(self_mem, top_k_ratio=0.05):
+            import torch
+            all_importances = []
+            with torch.no_grad():
+                for model_p in self_mem.models:
+                    for name, p in model_p.named_parameters():
+                        if not p.requires_grad: continue
+                        imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
+                        if name in self_mem.fisher_dict:
+                            imp = imp + self_mem.fisher_dict[name].cpu()
+                        all_importances.append(imp.view(-1))
+                if not all_importances: return
+                flat_imp = torch.cat(all_importances)
+                num_total = flat_imp.numel()
+                k = int(num_total * top_k_ratio)
+                if k > 0:
+                    if flat_imp.max() == flat_imp.min():
+                        print("  [SENTIENT] Importance is uniform. Skipping Sacred Core update to maintain plasticity.")
+                        return
+                    threshold = torch.topk(flat_imp, k).values[-1]
+                    total_sacred = 0
+                    for model_p in self_mem.models:
+                        for name, p in model_p.named_parameters():
+                            if not p.requires_grad: continue
+                            imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
+                            if name in self_mem.fisher_dict:
+                                imp = imp + self_mem.fisher_dict[name].cpu()
+                            new_sacred = (imp > threshold).cpu()
+                            self_mem.sacred_mask[name] = self_mem.sacred_mask.get(name, torch.zeros_like(p).cpu().bool()) | new_sacred
+                            total_sacred += self_mem.sacred_mask[name].sum().item()
+                    self_mem.saturation_level = total_sacred / num_total
+
+        import types
+        model.memory._update_sacred_core = types.MethodType(patched_update_sacred_core, model.memory)
+
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    metrics = MetricsEngine(project_name=project, method_name=full_method_name)
+    total_start_time = time.time()
+    task_step_times = []
 
     # Main Curriculum Loop
     for t_idx in range(10):
@@ -149,58 +150,40 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         # Post-task memory consolidation (V9.4 Eternal Protocol)
         if is_antara:
             print(f"\n[ANTARA] Post-task memory consolidated for Task {t_idx}.")
-            model.memory.consolidate(task_id=t_idx)
+            model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
             
-            # [PLASTICITY RESTORATION] 
-            # If saturation is > 10%, prune the mask to allow learning in Task N+1
+            # [PLASTICITY RESTORATION] Safety Valve
             if model.memory.saturation_level > 0.10:
-                print(f"  [SENTIENT] High Saturation ({model.memory.saturation_level:.2%}). Pruning Sacred Core for plasticity...")
+                print(f"  [SENTIENT] High Saturation ({model.memory.saturation_level:.2%}). Pruning for plasticity...")
                 for name in model.memory.sacred_mask:
-                    # Stochastically prune 50% of the least important sacred weights
                     mask = model.memory.sacred_mask[name]
                     if mask.any():
-                        # Simple random pruning to restore gradient flow
                         prune_mask = torch.rand_like(mask.float()) > 0.5
                         model.memory.sacred_mask[name] = mask & prune_mask.to(mask.device)
-                print(f"  [SENTIENT] Plasticity Restored. New Saturation: {model.memory.saturation_level/2:.2%}")
+                print(f"  [SENTIENT] Plasticity Restored.")
 
         # Unified Evaluation Autopsy
         evaluate_suite(model, curriculum, t_idx, metrics, device=device, hat_module=hat_module)
         
-        # Checkpoint & Telemetry Update
-        metrics.avg_step_time_ms = sum(task_step_times) / len(task_step_times)
-        metrics.total_compute_time_sec = time.time() - total_start_time
-        if device.type == 'cuda':
-            metrics.peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
-            # [LOG] Track VRAM Delta to verify O(1) stability
-            print(f"  [TELEMETRY] Task {t_idx} Peak VRAM: {metrics.peak_memory_mb:.2f} MB")
-            
-        os.makedirs("results", exist_ok=True)
-        metrics.save_results(f"results/{full_method_name}_metrics.json")
-        
-        if use_wandb:
-            metrics.sync_to_wandb(t_idx)
-
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-    metrics.generate_summary_report()
-    metrics.plot_heatmap(f"results/{full_method_name}_heatmap.png")
+    # Finalize
+    total_duration = time.time() - total_start_time
+    metrics.save_metrics(suffix=suffix)
+    print(f"\n[GAUNTLET COMPLETE] Method: {full_method_name}")
+    print(f"  Total Duration: {total_duration/60:.2f} minutes")
+    print(f"  Avg Step Time: {sum(task_step_times)/len(task_step_times):.4f}s")
+    
+    if wandb_sync:
+        wandb.finish()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", type=str, required=True, choices=[
-        "ANTARA_FULL", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE"
-    ])
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--method", type=str, required=True, choices=["ANTARA_FULL", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE"])
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases live logging")
+    parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--project", type=str, default="NeurIPS")
-    parser.add_argument("--entity", type=str, default="ultron09-airbornehrs")
-    parser.add_argument("--suffix", type=str, default="", help="Suffix to append to method name (e.g. _v2)")
+    parser.add_argument("--entity", type=str, default=None)
+    parser.add_argument("--suffix", type=str, default="")
     args = parser.parse_args()
     
-    run_experiment(args.method, device_str=args.device, seed=args.seed, 
-                   use_wandb=args.wandb, project_name=args.project, 
-                   entity_name=args.entity, suffix=args.suffix)
-#checking 16:10
+    run_experiment(args.method, args.device, args.wandb, args.project, args.entity, args.suffix, args.seed)
