@@ -92,6 +92,7 @@
         }
     },
     {
+<<<<<<< HEAD
         "method": "DER++",
         "timestamp": "2026-04-23T13:46:00.868632",
         "config": {
@@ -99,10 +100,20 @@
             "replay_buffer_size": null,
             "agem_buffer_size": null,
             "der_alpha": 0.1,
+=======
+        "method": "A-GEM",
+        "timestamp": "2026-04-23T13:58:59.768211",
+        "config": {
+            "ewc_lambda": null,
+            "replay_buffer_size": null,
+            "agem_buffer_size": 2000,
+            "der_alpha": null,
+>>>>>>> 35dded7d5c06e8db33945e969de2cfd907c8a5b3
             "hat_reg": null,
             "optimizer": "SGD",
             "lr": 0.01
         }
+<<<<<<< HEAD
     },
     {
         "method": "HAT",
@@ -116,5 +127,7 @@
             "optimizer": "SGD",
             "lr": 0.01
         }
+=======
+>>>>>>> 35dded7d5c06e8db33945e969de2cfd907c8a5b3
     }
 ]
