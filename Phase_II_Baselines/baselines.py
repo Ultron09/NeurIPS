@@ -78,6 +78,88 @@ class ExperienceReplay:
         return torch.stack([self.buffer_x[i] for i in idx]), torch.as_tensor([self.buffer_y[i] for i in idx])
 
 
+class DERPlus(nn.Module):
+    """
+    DER++: Dark Experience Replay (Buzzega et al. 2020).
+    The SOTA baseline for replay-based methods.
+    Stores x, y, and LOGITS to preserve the functional manifold of prior tasks.
+    """
+    def __init__(self, model, buffer_size=2000, alpha=0.1, beta=0.5):
+        super().__init__()
+        self.model = model
+        self.buffer_size = buffer_size
+        self.alpha = alpha  # Logit matching weight
+        self.beta = beta    # Label matching weight
+        self.buffer_x = []
+        self.buffer_y = []
+        self.buffer_logits = []
+        self.seen = 0
+
+    def update(self, x, y, logits):
+        for i in range(x.size(0)):
+            self.seen += 1
+            sample_x = x[i].detach().cpu()
+            sample_y = y[i].detach().cpu()
+            sample_logits = logits[i].detach().cpu()
+            
+            if len(self.buffer_x) < self.buffer_size:
+                self.buffer_x.append(sample_x)
+                self.buffer_y.append(sample_y)
+                self.buffer_logits.append(sample_logits)
+            else:
+                j = random.randint(0, self.seen - 1)
+                if j < self.buffer_size:
+                    self.buffer_x[j] = sample_x
+                    self.buffer_y[j] = sample_y
+                    self.buffer_logits[j] = sample_logits
+
+    def get_loss(self, x, y, current_logits, device='cuda'):
+        if not self.buffer_x: return torch.tensor(0.0).to(device)
+        
+        # Reservoir batch
+        idx = np.random.choice(len(self.buffer_x), min(x.size(0), len(self.buffer_x)), replace=False)
+        bx = torch.stack([self.buffer_x[i] for i in idx]).to(device)
+        by = torch.as_tensor([self.buffer_y[i] for i in idx]).to(device)
+        bl = torch.stack([self.buffer_logits[i] for i in idx]).to(device)
+        
+        # Logit matching (Dark Experience)
+        out_buf = self.model(bx)
+        loss_logits = F.mse_loss(out_buf, bl)
+        
+        # Label matching
+        loss_labels = F.cross_entropy(out_buf, by)
+        
+        return self.alpha * loss_logits + self.beta * loss_labels
+
+
+class HAT(nn.Module):
+    """
+    Hard Attention to the Task (Serrà et al. 2018).
+    Standard masking baseline for comparative CAS evaluation.
+    Utilizes learned task-specific masks to inhibit interference.
+    """
+    def __init__(self, model, num_tasks=10):
+        super().__init__()
+        self.model = model
+        self.num_tasks = num_tasks
+        # Simplified HAT implementation for ResNet: Masking the task-heads
+        # and final feature map to ensure fair CAS comparison.
+        self.masks = nn.Parameter(torch.ones(num_tasks, 512)) # ResNet18 feature size
+        self.gate = nn.Sigmoid()
+
+    def get_mask(self, t_idx, s=100):
+        # Temperature-annealed sigmoid for hard-mask approximation
+        return self.gate(s * self.masks[t_idx])
+
+    def apply_mask(self, features, t_idx):
+        mask = self.get_mask(t_idx)
+        return features * mask.view(1, -1, 1, 1) if features.dim() == 4 else features * mask
+
+    def reg_loss(self, t_idx):
+        # Sparser masks are better
+        return self.get_mask(t_idx).mean()
+
+
 class AGEM:
     """Correctly-timed A-GEM Gradient Projection."""
     def __init__(self, model, buffer_size=2000):

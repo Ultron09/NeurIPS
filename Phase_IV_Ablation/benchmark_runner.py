@@ -11,7 +11,7 @@ for d in ['Phase_I_Curriculum', 'Phase_II_Baselines', 'Phase_III_Metrics']:
 
 
 from dataset import SplitCIFAR100, set_seed
-from baselines import EWC, ExperienceReplay, AGEM
+from baselines import EWC, ExperienceReplay, AGEM, DERPlus, HAT
 from metrics import MetricsEngine
 from trainer import train_single_task
 from evaluation import evaluate_suite
@@ -75,44 +75,27 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
     ewc_module = None
     agem_module = None
     replay_buffer = None
+    der_module = None
+    hat_module = None
     config = None
     
     if method_name == "ANTARA_FULL":
-        # Full framework: H-MoE + Consciousness (RGW) + Hybrid Memory (EWC+SI) + Graph Memory (OGD)
+        # Full framework: H-MoE + Consciousness (RGW) + Joint Saliency Masking
         config = AdaptiveFrameworkConfig(
-            enable_consciousness=True,   # Activates RGW (Retrograde Gating Weighting)
-            importance_method='hybrid',   # [V9.4] Corrected field name
-            use_graph_memory=True,       # Graph memory is a flag, NOT a memory_type value
-            enable_world_model=True,     # [V9.0] Synthetic Intuition
-            use_moe=True,                # REQUIRED gate: without this, use_hierarchical_moe is ignored
-            use_hierarchical_moe=True,   # Activates H-MoE cortex
-            use_ogd=True,                # Activates Orthogonal Gradient Descent projection
-            input_dim=3072,              # [FIX] Flattened CIFAR-100 size (3*32*32) for MoE Gating
+            enable_consciousness=True,   
+            importance_method='hybrid',   
+            use_graph_memory=True,       
+            enable_world_model=True,     
+            use_moe=True,                
+            use_hierarchical_moe=True,   
+            use_ogd=True,                
+            input_dim=3072,              
+            # [V9.4] Hardened Thresholds
+            novelty_z_threshold=2.0,            # Tau_sim
+            consolidation_surprise_threshold=2.5, # Tau_H
+            adaptation_threshold=0.05,          # Tau_sat
             use_gradient_centralization=True,
             use_lookahead=True
-        )
-        model = AdaptiveFramework(model, config=config)
-    elif method_name == "ANTARA_RGW_ONLY":
-        # Ablation: Only Consciousness (RGW) active. Memory/OGD disabled.
-        config = AdaptiveFrameworkConfig(
-            enable_consciousness=True,   # RGW active
-            importance_method='none',    # [V9.4] Corrected field name
-            use_moe=True,                # REQUIRED gate
-            use_hierarchical_moe=True,
-            use_ogd=False,               # OGD disabled — pure ablation
-            input_dim=3072,              # [FIX] Match CIFAR-100
-        )
-        model = AdaptiveFramework(model, config=config)
-    elif method_name == "ANTARA_OGD_ONLY":
-        # Ablation: Only OGD+Memory active. Consciousness disabled.
-        config = AdaptiveFrameworkConfig(
-            enable_consciousness=False,  # RGW disabled — isolates OGD contribution
-            importance_method='hybrid',  # [V9.4] Corrected field name
-            use_graph_memory=False,
-            use_moe=True,                # REQUIRED gate
-            use_hierarchical_moe=True,
-            use_ogd=True,                # OGD active — pure ablation
-            input_dim=3072,              # [FIX] Match CIFAR-100
         )
         model = AdaptiveFramework(model, config=config)
     elif method_name == "EWC":
@@ -121,6 +104,10 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         replay_buffer = ExperienceReplay(buffer_size=2000)
     elif method_name == "A-GEM":
         agem_module = AGEM(model, buffer_size=2000)
+    elif method_name == "DER++":
+        der_module = DERPlus(model, buffer_size=2000)
+    elif method_name == "HAT":
+        hat_module = HAT(model, num_tasks=10).to(device)
     elif method_name == "NAIVE":
         pass
     else:
@@ -132,14 +119,13 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         "ewc_lambda": 5000 if method_name == "EWC" else None,
         "replay_buffer_size": 2000 if method_name == "REPLAY" else None,
         "agem_buffer_size": 2000 if method_name == "A-GEM" else None,
+        "der_alpha": 0.1 if method_name == "DER++" else None,
+        "hat_reg": 0.75 if method_name == "HAT" else None,
         "optimizer": "SGD",
-        "lr": 0.01,
-        "momentum": 0.9
+        "lr": 0.01
     }
     registry.log_experiment(method_name, hparams)
 
-    # Baselines use a shared external SGD optimizer.
-    # ANTARA manages its own internal AdamW + meta-optimizer + adapter-optimizer.
     is_antara = method_name.startswith("ANTARA")
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
@@ -151,6 +137,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         avg_step_time = train_single_task(model, train_loader, val_loader, optimizer, t_idx, 
                                           device=device, ewc_module=ewc_module, 
                                           agem_module=agem_module, replay_buffer=replay_buffer,
+                                          der_module=der_module, hat_module=hat_module,
                                           epochs=10)
         task_step_times.append(avg_step_time)
         
@@ -164,8 +151,10 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         # Checkpoint & Telemetry Update
         metrics.avg_step_time_ms = sum(task_step_times) / len(task_step_times)
         metrics.total_compute_time_sec = time.time() - total_start_time
-        if device == 'cuda':
+        if device.type == 'cuda':
             metrics.peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+            # [LOG] Track VRAM Delta to verify O(1) stability
+            print(f"  [TELEMETRY] Task {t_idx} Peak VRAM: {metrics.peak_memory_mb:.2f} MB")
             
         os.makedirs("results", exist_ok=True)
         metrics.save_results(f"results/{full_method_name}_metrics.json")
@@ -173,7 +162,6 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         if use_wandb:
             metrics.sync_to_wandb(t_idx)
 
-        # [STABILITY] Clear cache between tasks for the "weakest machine" fallback
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
@@ -183,7 +171,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", type=str, required=True, choices=[
-        "ANTARA_FULL", "ANTARA_RGW_ONLY", "ANTARA_OGD_ONLY", "EWC", "REPLAY", "A-GEM", "NAIVE"
+        "ANTARA_FULL", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE"
     ])
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)

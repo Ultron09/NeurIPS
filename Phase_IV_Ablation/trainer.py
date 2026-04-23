@@ -7,15 +7,15 @@ from tqdm import tqdm
 
 def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device='cuda',
                       ewc_module=None, agem_module=None, replay_buffer=None,
+                      der_module=None, hat_module=None,
                       epochs=10, patience=3):
     """
     Unified training logic with Cognitive Bifurcation:
     - ANTARA path: delegates entirely to model.train_step() (full cognitive loop)
-    - Baseline path: raw SGD loop for EWC, REPLAY, A-GEM, NAIVE
+    - Baseline path: raw SGD loop for EWC, REPLAY, A-GEM, DER++, HAT, NAIVE
     """
     best_loss = float('inf')
     best_model = copy.deepcopy(model.state_dict())
-    no_improve = 0
     total_step_time = 0.0
     total_steps = 0
 
@@ -36,27 +36,21 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
             if is_antara:
                 # ============================================================
                 # ANTARA COGNITIVE PATH
-                # Delegates fully to AdaptiveFramework.train_step()
-                # This activates: World Model, Consciousness, Introspection Engine,
-                # Unified Memory (EWC/SI/Graph), OGD Projection, Lookahead,
-                # Dreaming, Health Monitor, and Meta-Controller.
                 # ============================================================
                 try:
                     result = model.train_step(x, target_data=y,
-                                              task_id=str(t_idx), # Passing task context
+                                              task_id=str(t_idx), 
                                               enable_dream=True,
                                               meta_step=True,
                                               record_stats=True)
                     step_loss = result.get('total_loss', result.get('loss', 0.0))
                 except Exception as e:
-                    # Graceful fallback: if train_step fails, log and skip
                     print(f"  [ANTARA] train_step error at T{t_idx} E{epoch}: {e}")
                     step_loss = float('inf')
 
             else:
                 # ============================================================
-                # BASELINE PATH (EWC / REPLAY / A-GEM / NAIVE)
-                # Standard raw SGD loop for competitive benchmark purity.
+                # BASELINE PATH (EWC / REPLAY / A-GEM / DER++ / HAT / NAIVE)
                 # ============================================================
                 optimizer.zero_grad()
 
@@ -68,6 +62,11 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
 
                 # --- MAIN FORWARD PASS ---
                 logits = model(x)
+                
+                # --- HAT MASKING ---
+                if hat_module:
+                    logits = hat_module.apply_mask(logits, t_idx)
+
                 loss = F.cross_entropy(logits[:, :seen_classes], y)
 
                 # --- REPLAY INJECTION ---
@@ -77,9 +76,17 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                         r_logits = model(rx.to(device))
                         loss += F.cross_entropy(r_logits[:, :seen_classes], ry.to(device))
 
+                # --- DER++ LOGIT MATCHING ---
+                if der_module:
+                    loss += der_module.get_loss(x, y, logits, device=device)
+
                 # --- EWC PENALTY ---
                 if ewc_module:
                     loss += ewc_module.penalty()
+                
+                # --- HAT REGULARIZATION ---
+                if hat_module:
+                    loss += 0.75 * hat_module.reg_loss(t_idx)
 
                 loss.backward()
 
@@ -105,6 +112,8 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                     agem_module.buffer.update(x, y)
                 if replay_buffer:
                     replay_buffer.update(x, y)
+                if der_module:
+                    der_module.update(x, y, logits.detach())
 
                 step_loss = loss.item()
 
@@ -112,7 +121,6 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
             total_steps += 1
 
         # [V9.2] Validation: Periodic check but NO early stopping
-        # This keeps the training schedule fixed for scientifically sound comparison.
         val_loss = validate(model, val_loader, seen_classes, device, is_antara=is_antara)
         if val_loss < best_loss:
             best_loss = val_loss
@@ -122,15 +130,12 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
     model.load_state_dict(best_model)
 
     # --- POST-TASK ANTARA MEMORY CONSOLIDATION ---
-    # After a task is fully learned, force a hard memory consolidation.
-    # This anchors the Fisher Information Matrix (EWC) and the SI path integrals
-    # into permanent memory, making the next task's OGD projection bulletproof.
     if is_antara:
         try:
             model.consolidate_memory(
                 feedback_buffer=model.feedback_buffer,
                 current_step=getattr(model, 'step_count', 0),
-                z_score=2.5,    # Force consolidation at max surprise threshold
+                z_score=2.5,
                 mode='NORMAL'
             )
             print(f"  [ANTARA] Post-task memory consolidated for Task {t_idx}.")
@@ -139,7 +144,6 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
 
     avg_step_time = total_step_time / total_steps if total_steps > 0 else 0
     return avg_step_time
-
 
 def validate(model, loader, seen_classes, device, is_antara=False):
     """
