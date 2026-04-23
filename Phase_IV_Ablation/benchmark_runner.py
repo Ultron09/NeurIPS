@@ -176,6 +176,8 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         # Post-task anchoring
         if method_name == "EWC":
             ewc_module.save_task_weights(train_loader, device=device)
+        elif method_name == "HAT":
+            hat_module.update_cumulative_mask(t_idx)
             
         # Post-task memory consolidation (V9.4 Eternal Protocol)
         if is_antara:
@@ -226,7 +228,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--project", type=str, default="NeurIPS")
-    parser.add_argument("--entity", type=str, default=None)
+    parser.add_argument("--entity", type=str, default="ultron09-airbornehrs")
     parser.add_argument("--suffix", type=str, default="")
     args = parser.parse_args()
     

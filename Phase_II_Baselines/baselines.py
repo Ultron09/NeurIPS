@@ -142,13 +142,12 @@ class HAT(nn.Module):
         super().__init__()
         self.model = model
         self.num_tasks = num_tasks
-        # Simplified HAT implementation for ResNet: Masking the task-heads
-        # and final feature map to ensure fair CAS comparison.
         self.masks = nn.Parameter(torch.ones(num_tasks, 512)) # ResNet18 feature size
         self.gate = nn.Sigmoid()
+        # Track cumulative importance to block future updates
+        self.register_buffer('cumulative_mask', torch.zeros(512))
 
     def get_mask(self, t_idx, s=100):
-        # Temperature-annealed sigmoid for hard-mask approximation
         return self.gate(s * self.masks[t_idx])
 
     def apply_mask(self, features, t_idx):
@@ -156,8 +155,26 @@ class HAT(nn.Module):
         return features * mask.view(1, -1, 1, 1) if features.dim() == 4 else features * mask
 
     def reg_loss(self, t_idx):
-        # Sparser masks are better
         return self.get_mask(t_idx).mean()
+
+    def mask_gradients(self, model):
+        """
+        [Serrà et al. 2018] Zero gradients for features used by PREVIOUS tasks.
+        """
+        if self.cumulative_mask.sum() == 0: return
+        
+        with torch.no_grad():
+            # For ResNet18, we target the 'fc' layer which uses the masked features
+            if hasattr(model, 'fc'):
+                # cumulative_mask is 512-dim, fc.weight is [100, 512]
+                if model.fc.weight.grad is not None:
+                    # Expand mask to [100, 512] and zero out stale weights
+                    m = self.cumulative_mask.view(1, -1).expand_as(model.fc.weight)
+                    model.fc.weight.grad.data.mul_(1 - m)
+
+    def update_cumulative_mask(self, t_idx):
+        with torch.no_grad():
+            self.cumulative_mask = torch.max(self.cumulative_mask, self.get_mask(t_idx).detach())
 
 
 class AGEM:

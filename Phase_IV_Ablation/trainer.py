@@ -124,6 +124,11 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                         p.grad = projected[pointer:pointer + p.numel()].view_as(p).clone()
                         pointer += p.numel()
 
+                # --- HAT GRADIENT MASKING ---
+                if hat_module:
+                    # Serrà et al. (2018): Zero gradients for weights not belonging to current task
+                    hat_module.mask_gradients(model)
+
                 optimizer.step()
 
                 # --- POST-OPTIMIZATION BUFFER STORAGE ---
