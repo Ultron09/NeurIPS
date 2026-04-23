@@ -2,7 +2,7 @@ import torch
 from metrics import MetricsEngine
 
 
-def evaluate_suite(model, curriculum, t_idx, metrics_engine: MetricsEngine, device='cuda'):
+def evaluate_suite(model, curriculum, t_idx, metrics_engine: MetricsEngine, device='cuda', hat_module=None):
     """
     Evaluates the model on all tasks after learning task t_idx.
     Supports both:
@@ -27,22 +27,31 @@ def evaluate_suite(model, curriculum, t_idx, metrics_engine: MetricsEngine, devi
 
                 if is_antara:
                     # ANTARA COGNITIVE PATH
-                    # Use inference_step for a clean, non-training forward pass
-                    # that still activates the Consciousness module for diagnostics.
                     try:
                         logits = model.inference_step(x)
                         if isinstance(logits, tuple):
                             logits = logits[0]
                     except Exception:
-                        # Fallback: unpack tuple from standard forward
                         out = model(x)
-                        if isinstance(out, tuple):
-                            logits = out[0]
-                        else:
-                            logits = out
+                        logits = out[0] if isinstance(out, tuple) else out
                 else:
-                    # BASELINE PATH: direct forward pass
-                    logits = model(x)
+                    # BASELINE PATH
+                    if hat_module:
+                        # HAT EVAL: Use bifurcated pass with task-specific mask
+                        x_f = model.conv1(x)
+                        x_f = model.bn1(x_f)
+                        x_f = model.relu(x_f)
+                        x_f = model.maxpool(x_f)
+                        x_f = model.layer1(x_f)
+                        x_f = model.layer2(x_f)
+                        x_f = model.layer3(x_f)
+                        x_f = model.layer4(x_f)
+                        x_f = model.avgpool(x_f)
+                        features = torch.flatten(x_f, 1)
+                        masked_features = hat_module.apply_mask(features, eval_task_idx)
+                        logits = model.fc(masked_features)
+                    else:
+                        logits = model(x)
 
                 # Class-IL: Predicted class is argmax over ALL seen classes so far
                 active_output_space = seen_tasks * 10

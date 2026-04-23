@@ -61,13 +61,32 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                     optimizer.zero_grad()
 
                 # --- MAIN FORWARD PASS ---
-                logits = model(x)
-                
-                # --- HAT MASKING ---
                 if hat_module:
-                    logits = hat_module.apply_mask(logits, t_idx)
+                    # Bifurcated Forward: Extract 512-dim features for masking
+                    # (Standard ResNet-18 execution order until fc)
+                    x_f = model.conv1(x)
+                    x_f = model.bn1(x_f)
+                    x_f = model.relu(x_f)
+                    x_f = model.maxpool(x_f)
+                    x_f = model.layer1(x_f)
+                    x_f = model.layer2(x_f)
+                    x_f = model.layer3(x_f)
+                    x_f = model.layer4(x_f)
+                    x_f = model.avgpool(x_f)
+                    features = torch.flatten(x_f, 1)
+                    
+                    # Apply task-specific hard attention
+                    masked_features = hat_module.apply_mask(features, t_idx)
+                    logits = model.fc(masked_features)
+                else:
+                    logits = model(x)
 
                 loss = F.cross_entropy(logits[:, :seen_classes], y)
+
+                # --- HAT REGULARIZATION ---
+                if hat_module:
+                    # Serrà et al. (2018) sparsity penalty (c=0.75)
+                    loss += 0.75 * hat_module.reg_loss(t_idx)
 
                 # --- REPLAY INJECTION ---
                 if replay_buffer:
@@ -121,7 +140,7 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
             total_steps += 1
 
         # [V9.2] Validation: Periodic check but NO early stopping
-        val_loss = validate(model, val_loader, seen_classes, device, is_antara=is_antara)
+        val_loss = validate(model, val_loader, seen_classes, device, is_antara=is_antara, hat_module=hat_module, t_idx=t_idx)
         if val_loss < best_loss:
             best_loss = val_loss
             best_model = copy.deepcopy(model.state_dict())
@@ -145,7 +164,7 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
     avg_step_time = total_step_time / total_steps if total_steps > 0 else 0
     return avg_step_time
 
-def validate(model, loader, seen_classes, device, is_antara=False):
+def validate(model, loader, seen_classes, device, is_antara=False, hat_module=None, t_idx=0):
     """
     Validation loop. Safely extracts logits from both Antara and baseline models.
     """
@@ -166,7 +185,22 @@ def validate(model, loader, seen_classes, device, is_antara=False):
                     out = model(x)
                     logits = out[0] if isinstance(out, tuple) else out
             else:
-                logits = model(x)
+                if hat_module:
+                    # HAT Inference: Must use bifurcated pass with task mask
+                    x_f = model.conv1(x)
+                    x_f = model.bn1(x_f)
+                    x_f = model.relu(x_f)
+                    x_f = model.maxpool(x_f)
+                    x_f = model.layer1(x_f)
+                    x_f = model.layer2(x_f)
+                    x_f = model.layer3(x_f)
+                    x_f = model.layer4(x_f)
+                    x_f = model.avgpool(x_f)
+                    features = torch.flatten(x_f, 1)
+                    masked_features = hat_module.apply_mask(features, t_idx)
+                    logits = model.fc(masked_features)
+                else:
+                    logits = model(x)
 
             # Safe slicing: only score over classes seen so far
             effective_classes = min(seen_classes, logits.shape[1])

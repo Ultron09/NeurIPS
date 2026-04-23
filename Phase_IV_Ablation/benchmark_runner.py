@@ -41,7 +41,7 @@ def model_factory():
 def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False, 
                    project_name="NeurIPS", entity_name="ultron09-airbornehrs",
                    suffix=""):
-    full_method_name = f"{method_name}{suffix}"
+    full_method_name = f"{method_name}{suffix}_seed{seed}"
     print(f"\n[NEURIPS GAUNTLET] Executing Branch: {full_method_name}")
     
     device = setup_compute(device_str)
@@ -124,7 +124,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
         "optimizer": "SGD",
         "lr": 0.01
     }
-    registry.log_experiment(method_name, hparams)
+    registry.log_experiment(full_method_name, hparams)
 
     is_antara = method_name.startswith("ANTARA")
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
@@ -146,7 +146,7 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
             ewc_module.save_task_weights(train_loader, device=device)
             
         # Unified Evaluation Autopsy
-        evaluate_suite(model, curriculum, t_idx, metrics, device=device)
+        evaluate_suite(model, curriculum, t_idx, metrics, device=device, hat_module=hat_module)
         
         # Checkpoint & Telemetry Update
         metrics.avg_step_time_ms = sum(task_step_times) / len(task_step_times)

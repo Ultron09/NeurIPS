@@ -90,5 +90,31 @@
             "health_check_interval": 100,
             "enable_performance_monitor": false
         }
+    },
+    {
+        "method": "DER++",
+        "timestamp": "2026-04-23T13:46:00.868632",
+        "config": {
+            "ewc_lambda": null,
+            "replay_buffer_size": null,
+            "agem_buffer_size": null,
+            "der_alpha": 0.1,
+            "hat_reg": null,
+            "optimizer": "SGD",
+            "lr": 0.01
+        }
+    },
+    {
+        "method": "HAT",
+        "timestamp": "2026-04-23T15:09:53.799540",
+        "config": {
+            "ewc_lambda": null,
+            "replay_buffer_size": null,
+            "agem_buffer_size": null,
+            "der_alpha": null,
+            "hat_reg": 0.75,
+            "optimizer": "SGD",
+            "lr": 0.01
+        }
     }
 ]
