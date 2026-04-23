@@ -177,12 +177,12 @@ def validate(model, loader, seen_classes, device, is_antara=False, hat_module=No
             if is_antara:
                 # Use inference_step for clean, diagnostic-free evaluation
                 try:
-                    logits = model.inference_step(x)
+                    logits = model.inference_step(x, task_id=t_idx)
                     if isinstance(logits, tuple):
                         logits = logits[0]
                 except Exception:
                     # Fallback: direct forward, unpack tuple
-                    out = model(x)
+                    out = model(x, task_id=t_idx)
                     logits = out[0] if isinstance(out, tuple) else out
             else:
                 if hat_module:
