@@ -138,6 +138,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
 
         # [V9.4] Knowledge Anchoring Patch
+        import types
         # [V9.4] Live Protection Registry
         model.memory.param_id_to_mask = {}
 
