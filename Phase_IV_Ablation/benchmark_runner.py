@@ -103,18 +103,23 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                 for model_p in self_mem.models:
                     for name, p in model_p.named_parameters():
                         if not p.requires_grad: continue
+                        
+                        # Hybrid Importance: SI + EWC
                         imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
                         if name in self_mem.fisher_dict:
                             imp = imp + self_mem.fisher_dict[name].cpu()
                         all_importances.append(imp.view(-1))
+                
                 if not all_importances: return
+                
                 flat_imp = torch.cat(all_importances)
+                if flat_imp.max() == flat_imp.min():
+                    print("  [SENTIENT] Importance is uniform. Skipping Sacred Core update.")
+                    return
+                
                 num_total = flat_imp.numel()
                 k = int(num_total * top_k_ratio)
                 if k > 0:
-                    if flat_imp.max() == flat_imp.min():
-                        print("  [SENTIENT] Importance is uniform. Skipping Sacred Core update to maintain plasticity.")
-                        return
                     threshold = torch.topk(flat_imp, k).values[-1]
                     total_sacred = 0
                     for model_p in self_mem.models:
@@ -123,13 +128,33 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                             imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
                             if name in self_mem.fisher_dict:
                                 imp = imp + self_mem.fisher_dict[name].cpu()
-                            new_sacred = (imp > threshold).cpu()
+                            
+                            # [V9.4 FIX] Anchor weights using >= threshold
+                            new_sacred = (imp >= threshold).cpu()
                             self_mem.sacred_mask[name] = self_mem.sacred_mask.get(name, torch.zeros_like(p).cpu().bool()) | new_sacred
                             total_sacred += self_mem.sacred_mask[name].sum().item()
+                    
                     self_mem.saturation_level = total_sacred / num_total
+                    print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
 
         import types
         model.memory._update_sacred_core = types.MethodType(patched_update_sacred_core, model.memory)
+        
+        # [V9.4 HARDENING] Inject Gradient Sentinel Hooks
+        # Since the library fails to apply its own mask, we force it via PyTorch autograd hooks.
+        def get_sentinel_hook(p_name, mem_obj):
+            def hook(grad):
+                if p_name in mem_obj.sacred_mask:
+                    mask = mem_obj.sacred_mask[p_name].to(grad.device)
+                    return grad * (~mask)
+                return grad
+            return hook
+
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                p.register_hook(get_sentinel_hook(name, model.memory))
+        
+        print("  [SYSTEM] Gradient Sentinel Hooks successfully attached to Neural Architecture.")
 
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     metrics = MetricsEngine(num_tasks=10, config_name=full_method_name)
@@ -154,18 +179,23 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             
         # Post-task memory consolidation (V9.4 Eternal Protocol)
         if is_antara:
-            print(f"\n[ANTARA] Post-task memory consolidated for Task {t_idx}.")
+            print(f"\n[ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
             model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
             
-            # [PLASTICITY RESTORATION] Safety Valve
-            if model.memory.saturation_level > 0.10:
-                print(f"  [SENTIENT] High Saturation ({model.memory.saturation_level:.2%}). Pruning for plasticity...")
+            # [PLASTICITY RESTORATION] Safety Valve (Raised to 50% for CIFAR-100)
+            if model.memory.saturation_level > 0.50:
+                print(f"  [SENTIENT] High Saturation ({model.memory.saturation_level:.2%}). Restoring Plasticity...")
                 for name in model.memory.sacred_mask:
                     mask = model.memory.sacred_mask[name]
                     if mask.any():
-                        prune_mask = torch.rand_like(mask.float()) > 0.5
+                        prune_mask = torch.rand_like(mask.float()) > 0.50
                         model.memory.sacred_mask[name] = mask & prune_mask.to(mask.device)
-                print(f"  [SENTIENT] Plasticity Restored.")
+                
+                # Recompute saturation
+                total_sacred = sum(m.sum().item() for m in model.memory.sacred_mask.values())
+                num_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                model.memory.saturation_level = total_sacred / num_total
+                print(f"  [SENTIENT] Plasticity Restored. New Saturation: {model.memory.saturation_level:.2%}")
 
         # Unified Evaluation Autopsy
         evaluate_suite(model, curriculum, t_idx, metrics, device=device, hat_module=hat_module)
