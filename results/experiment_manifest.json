@@ -142,5 +142,44 @@
             "optimizer": "SGD",
             "lr": 0.01
         }
+    },
+    {
+        "method": "DER++_V3_seed42",
+        "timestamp": "2026-04-23T16:26:03.196390",
+        "config": {
+            "ewc_lambda": null,
+            "replay_buffer_size": null,
+            "agem_buffer_size": null,
+            "der_alpha": 0.1,
+            "hat_reg": null,
+            "optimizer": "SGD",
+            "lr": 0.01
+        }
+    },
+    {
+        "method": "DER++_V3_seed123",
+        "timestamp": "2026-04-23T16:33:16.789480",
+        "config": {
+            "ewc_lambda": null,
+            "replay_buffer_size": null,
+            "agem_buffer_size": null,
+            "der_alpha": 0.1,
+            "hat_reg": null,
+            "optimizer": "SGD",
+            "lr": 0.01
+        }
+    },
+    {
+        "method": "DER++_V3_seed456",
+        "timestamp": "2026-04-23T16:41:24.568992",
+        "config": {
+            "ewc_lambda": null,
+            "replay_buffer_size": null,
+            "agem_buffer_size": null,
+            "der_alpha": 0.1,
+            "hat_reg": null,
+            "optimizer": "SGD",
+            "lr": 0.01
+        }
     }
 ]
