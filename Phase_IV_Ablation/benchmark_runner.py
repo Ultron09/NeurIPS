@@ -62,12 +62,17 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             use_moe=True,
             use_hierarchical_moe=True,   
             use_ogd=True,                
+            ogd_max_basis_size=256,
             input_dim=3072,              
-            # [V9.4] Hardened Thresholds for Class-IL
+            # [V9.4] Hardened Defense Protocol
             learning_rate=5e-3,                 
-            novelty_z_threshold=1.5,            
-            consolidation_surprise_threshold=2.5, 
-            adaptation_threshold=0.02,          
+            ewc_lambda=10000.0,                 # [CRITICAL] Crank up protection
+            si_lambda=10.0,                     # [CRITICAL] Online importance
+            use_reptile=True,                   # [STABILITY] Manifold alignment
+            reptile_learning_rate=0.1,
+            use_learned_optimizer=True,         # [ADAPTATION] Meta-update
+            novelty_z_threshold=1.2,            # [SENSITIVITY] Lowered for Task 1 detection
+            adaptation_threshold=0.01,          # [PLASTICITY] Tightened
             use_gradient_centralization=True,
             use_lookahead=True
         )
@@ -91,7 +96,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     
     # [MONKEY-PATCH] Fix the 100% Saturation Bug in V9.4
     if is_antara:
-        def patched_update_sacred_core(self_mem, top_k_ratio=0.05):
+        def patched_update_sacred_core(self_mem, top_k_ratio=0.01):
             import torch
             all_importances = []
             with torch.no_grad():
