@@ -142,22 +142,32 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         model.memory._update_sacred_core = types.MethodType(patched_update_sacred_core, model.memory)
         print(f"  [BRAIN] Unified Memory Protection Engaged. Tracking {len(model.memory.models)} modules.")
 
-        # [V9.4 HARDENING] Inject Gradient Sentinel Hooks
-        def get_sentinel_hook(p_name, mem_obj):
+        # [V9.4 HARDENING] Inject Hash-Locked Gradient Sentinel Hooks
+        # This resolves the 'Naming Schism' where experts have different names for the same shared backbone.
+        param_to_mask = {}
+        for name, p in model.named_parameters():
+            if name in model.memory.sacred_mask:
+                param_to_mask[id(p)] = model.memory.sacred_mask[name]
+
+        def get_id_sentinel_hook(p_obj):
+            p_id = id(p_obj)
             def hook(grad):
-                if p_name in mem_obj.sacred_mask:
-                    mask = mem_obj.sacred_mask[p_name].to(grad.device)
-                    # Surgical gradient shunting
+                if p_id in param_to_mask:
+                    mask = param_to_mask[p_id].to(grad.device)
+                    # Surgical gradient shunting: 0 gradients for sacred weights
                     return grad * (~mask)
                 return grad
             return hook
 
+        # Register hooks on ALL parameters of ALL tracked models
+        hook_count = 0
         for tracked_model in model.memory.models:
-            for name, p in tracked_model.named_parameters():
+            for p in tracked_model.parameters():
                 if p.requires_grad:
-                    p.register_hook(get_sentinel_hook(name, model.memory))
+                    p.register_hook(get_id_sentinel_hook(p))
+                    hook_count += 1
         
-        print("  [SYSTEM] Full-Spectrum Gradient Sentinel Hooks successfully attached.")
+        print(f"  [SYSTEM] {hook_count} Hash-Locked Sentinel Hooks successfully attached.")
 
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     metrics = MetricsEngine(num_tasks=10, config_name=full_method_name)
