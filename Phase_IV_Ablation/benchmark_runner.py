@@ -83,10 +83,13 @@ def run_experiment(method_name, device_str='cuda', seed=42, use_wandb=False,
             enable_consciousness=True,   # Activates RGW (Retrograde Gating Weighting)
             importance_method='hybrid',   # [V9.4] Corrected field name
             use_graph_memory=True,       # Graph memory is a flag, NOT a memory_type value
+            enable_world_model=True,     # [V9.0] Synthetic Intuition
             use_moe=True,                # REQUIRED gate: without this, use_hierarchical_moe is ignored
             use_hierarchical_moe=True,   # Activates H-MoE cortex
             use_ogd=True,                # Activates Orthogonal Gradient Descent projection
             input_dim=3072,              # [FIX] Flattened CIFAR-100 size (3*32*32) for MoE Gating
+            use_gradient_centralization=True,
+            use_lookahead=True
         )
         model = AdaptiveFramework(model, config=config)
     elif method_name == "ANTARA_RGW_ONLY":

@@ -11,12 +11,19 @@ if __name__ == "__main__":
     config = AdaptiveFrameworkConfig(
         enable_consciousness=True,
         memory_type='graph',
+        use_graph_memory=True, # Explicitly enable graph memory
+        enable_holographic_compression=True,
+        enable_world_model=True, # [V9.0] Synthetic Intuition
+        use_moe=True, # [V7.1] Required gate for MoE
         use_hierarchical_moe=True,
+        input_dim=3072, # CIFAR-100 flattened (3*32*32) for MoE gating
         enable_health_monitor=True,
         health_check_interval=100,
         use_ogd=True,
         ogd_max_basis_size=256,
-        ewc_lambda=1000
+        ewc_lambda=1000,
+        use_gradient_centralization=True,
+        use_lookahead=True
     )
     
     orchestrator = AblationOrchestrator(
