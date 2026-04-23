@@ -127,7 +127,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         model.memory._update_sacred_core = types.MethodType(patched_update_sacred_core, model.memory)
 
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-    metrics = MetricsEngine(project_name=project, method_name=full_method_name)
+    metrics = MetricsEngine(num_tasks=10, config_name=full_method_name)
     total_start_time = time.time()
     task_step_times = []
 
