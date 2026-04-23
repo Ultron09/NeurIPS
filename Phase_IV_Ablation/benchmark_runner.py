@@ -140,16 +140,51 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         # [V9.4] Knowledge Anchoring Patch
         import types
         # [V9.4] Live Protection Registry
+        # [V9.4] Live Protection Registry
         model.memory.param_id_to_mask = {}
 
-        # Re-inject the anchoring patch to also update the ID-map
-        original_update = patched_update_sacred_core
-        def dynamic_id_update(self_mem, importance_dict):
-            original_update(self_mem, importance_dict)
-            # Update the ID-based map from the newly anchored names
-            for name, p in model.named_parameters():
-                if name in self_mem.sacred_mask:
-                    self_mem.param_id_to_mask[id(p)] = self_mem.sacred_mask[name]
+        # Re-inject the anchoring patch with CORRECT signature
+        def dynamic_id_update(self_mem, top_k_ratio=0.2):
+            # 1. Run the actual anchoring logic (which I previously defined as patched_update_sacred_core)
+            # But let's just implement the logic here to be safe and clean.
+            
+            all_importances = []
+            with torch.no_grad():
+                for m in self_mem.models:
+                    for name, p in m.named_parameters():
+                        if not p.requires_grad: continue
+                        imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
+                        if name in self_mem.fisher_dict:
+                            imp = imp + self_mem.fisher_dict[name].cpu()
+                        all_importances.append(imp.view(-1))
+            
+            if all_importances:
+                flat_imp = torch.cat(all_importances)
+                if flat_imp.numel() > 0:
+                    threshold = torch.quantile(flat_imp, 1.0 - top_k_ratio)
+                    # Update masks
+                    for m in self_mem.models:
+                        for name, p in m.named_parameters():
+                            if not p.requires_grad: continue
+                            imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
+                            if name in self_mem.fisher_dict:
+                                imp = imp + self_mem.fisher_dict[name].cpu()
+                            
+                            mask = (imp >= threshold).bool()
+                            if name in self_mem.sacred_mask:
+                                self_mem.sacred_mask[name] = self_mem.sacred_mask[name] | mask
+                            else:
+                                self_mem.sacred_mask[name] = mask
+                            
+                            # UPDATE THE ID-BASED MAP
+                            if self_mem.sacred_mask[name].any():
+                                self_mem.param_id_to_mask[id(p)] = self_mem.sacred_mask[name]
+
+            # Calculate saturation
+            total_params = sum(p.numel() for m in self_mem.models for p in m.parameters() if p.requires_grad)
+            locked_params = sum(mask.sum().item() for mask in self_mem.sacred_mask.values())
+            self_mem.saturation_level = locked_params / total_params if total_params > 0 else 0.0
+            print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
 
         model.memory._update_sacred_core = types.MethodType(dynamic_id_update, model.memory)
 
