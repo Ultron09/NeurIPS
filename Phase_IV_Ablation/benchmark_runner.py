@@ -150,9 +150,10 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                 return grad
             return hook
 
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                p.register_hook(get_sentinel_hook(name, model.memory))
+        for tracked_model in model.memory.models:
+            for name, p in tracked_model.named_parameters():
+                if p.requires_grad:
+                    p.register_hook(get_sentinel_hook(name, model.memory))
         
         print("  [SYSTEM] Gradient Sentinel Hooks successfully attached to Neural Architecture.")
 
@@ -183,6 +184,12 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         if is_antara:
             print(f"\n[ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
             model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
+            
+            # Recompute saturation
+            total_sacred = sum(m.sum().item() for m in model.memory.sacred_mask.values())
+            num_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            model.memory.saturation_level = total_sacred / num_total
+            print(f"  [SENTIENT] Knowledge Anchored. Locked Parameters: {total_sacred:,} / {num_total:,} ({model.memory.saturation_level:.2%})")
             
             # [PLASTICITY RESTORATION] Safety Valve (Raised to 50% for CIFAR-100)
             if model.memory.saturation_level > 0.50:
