@@ -57,8 +57,8 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     if method_name == "ANTARA_FULL":
         config = AdaptiveFrameworkConfig(
             model_dim=256,
-            num_experts=4,
-            top_k_experts=2,
+            num_experts=10,
+            top_k_experts=1,
             use_moe=True,
             use_hierarchical_moe=True,   
             use_ogd=True,                
