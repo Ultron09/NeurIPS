@@ -96,94 +96,87 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     
     # [MONKEY-PATCH] Fix the 100% Saturation Bug in V9.4
     if is_antara:
-        def patched_update_sacred_core(self_mem, top_k_ratio=0.01):
-            import torch
-            all_importances = []
-            with torch.no_grad():
-                for model_p in self_mem.models:
-                    for name, p in model_p.named_parameters():
-                        if not p.requires_grad: continue
-                        
-                        # Hybrid Importance: SI + EWC
-                        imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
-                        if name in self_mem.fisher_dict:
-                            imp = imp + self_mem.fisher_dict[name].cpu()
-                        all_importances.append(imp.view(-1))
-                
-                if not all_importances: return
-                
-                flat_imp = torch.cat(all_importances)
-                if flat_imp.max() == flat_imp.min():
-                    print("  [SENTIENT] Importance is uniform. Skipping Sacred Core update.")
-                    return
-                
-                num_total = flat_imp.numel()
-                k = int(num_total * top_k_ratio)
-                if k > 0:
-                    threshold = torch.topk(flat_imp, k).values[-1]
-                    total_sacred = 0
-                    for model_p in self_mem.models:
-                        for name, p in model_p.named_parameters():
-                            if not p.requires_grad: continue
-                            imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
-                            if name in self_mem.fisher_dict:
-                                imp = imp + self_mem.fisher_dict[name].cpu()
-                            
-                            # [V9.4 FIX] Anchor weights using >= threshold
-                            new_sacred = (imp >= threshold).cpu()
-                            self_mem.sacred_mask[name] = self_mem.sacred_mask.get(name, torch.zeros_like(p).cpu().bool()) | new_sacred
-                            total_sacred += self_mem.sacred_mask[name].sum().item()
-                    
-                    self_mem.saturation_level = total_sacred / num_total
-                    print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
-
-        # [V9.4] Knowledge Anchoring Patch
         import types
-        # [V9.4] Live Protection Registry
-        # [V9.4] Live Protection Registry
+        print("  [SYSTEM] Initializing Neuro-Stability V10...")
+
+        # [V10] Live Protection Registry
         model.memory.param_id_to_mask = {}
 
-        # Re-inject the anchoring patch with CORRECT signature
-        def dynamic_id_update(self_mem, top_k_ratio=0.2):
-            # 1. Run the actual anchoring logic (which I previously defined as patched_update_sacred_core)
-            # But let's just implement the logic here to be safe and clean.
+        # [V10] MoE Propagation Fix: Patch AdaptiveFramework.forward to pass task_id
+        # This is CRITICAL to prevent Task 1 training from destroying Expert 0
+        original_forward = model.forward
+        def patched_forward(self_fw, *args, **kwargs):
+            t_id = kwargs.get('task_id')
+            if t_id is None:
+                t_id = getattr(self_fw, '_current_task_id', None)
             
+            # If task_id is found, ensure it's in kwargs for the underlying Experts
+            if t_id is not None:
+                kwargs['task_id'] = t_id
+                
+            return original_forward(*args, **kwargs)
+        
+        model.forward = types.MethodType(patched_forward, model)
+
+        # [V10] Disable Framework Auto-Consolidation to prevent interference during epochs
+        if hasattr(model, 'consolidation_scheduler') and model.consolidation_scheduler:
+            model.consolidation_scheduler.should_consolidate = lambda *args, **kwargs: (False, "External Control")
+
+        # [V10] Robust thresholding using kthvalue (Avoids quantile CPU errors for large tensors)
+        def dynamic_id_update(self_mem, top_k_ratio=0.15): # Increased ratio for NeurIPS hardening
+            import torch
             all_importances = []
+            param_map = {} # name -> p object
+            
             with torch.no_grad():
-                for m in self_mem.models:
-                    for name, p in m.named_parameters():
+                for m_tracked in self_mem.models:
+                    for name, p in m_tracked.named_parameters():
                         if not p.requires_grad: continue
+                        param_map[name] = p
+                        
+                        # Hybrid Importance: SI (omega) + EWC (fisher)
                         imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
                         if name in self_mem.fisher_dict:
                             imp = imp + self_mem.fisher_dict[name].cpu()
                         all_importances.append(imp.view(-1))
             
-            if all_importances:
-                flat_imp = torch.cat(all_importances)
-                if flat_imp.numel() > 0:
-                    threshold = torch.quantile(flat_imp, 1.0 - top_k_ratio)
-                    # Update masks
-                    for m in self_mem.models:
-                        for name, p in m.named_parameters():
-                            if not p.requires_grad: continue
-                            imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
-                            if name in self_mem.fisher_dict:
-                                imp = imp + self_mem.fisher_dict[name].cpu()
-                            
-                            mask = (imp >= threshold).bool()
-                            if name in self_mem.sacred_mask:
-                                self_mem.sacred_mask[name] = self_mem.sacred_mask[name] | mask
-                            else:
-                                self_mem.sacred_mask[name] = mask
-                            
-                            # UPDATE THE ID-BASED MAP
-                            if self_mem.sacred_mask[name].any():
-                                self_mem.param_id_to_mask[id(p)] = self_mem.sacred_mask[name]
+            if not all_importances: return
+            
+            flat_imp = torch.cat(all_importances)
+            num_total = flat_imp.numel()
+            
+            # Calculate threshold using kthvalue (1.0 - ratio) percentile
+            k = int((1.0 - top_k_ratio) * num_total)
+            k = max(1, min(k, num_total))
+            
+            try:
+                threshold = torch.kthvalue(flat_imp, k).values.item()
+            except Exception as e:
+                print(f"  [DEBUG] kthvalue failed ({e}), falling back to mean.")
+                threshold = flat_imp.mean().item()
 
-            # Calculate saturation
-            total_params = sum(p.numel() for m in self_mem.models for p in m.parameters() if p.requires_grad)
-            locked_params = sum(mask.sum().item() for mask in self_mem.sacred_mask.values())
-            self_mem.saturation_level = locked_params / total_params if total_params > 0 else 0.0
+            # Update masks and populate the ID-based registry
+            protected_this_call = 0
+            for m_tracked in self_mem.models:
+                for name, p in m_tracked.named_parameters():
+                    if not p.requires_grad: continue
+                    imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
+                    if name in self_mem.fisher_dict:
+                        imp = imp + self_mem.fisher_dict[name].cpu()
+                    
+                    mask = (imp >= threshold).bool()
+                    # OR with existing mask to keep old knowledge locked
+                    if name in self_mem.sacred_mask:
+                        self_mem.sacred_mask[name] = self_mem.sacred_mask[name] | mask
+                    else:
+                        self_mem.sacred_mask[name] = mask
+                    
+                    # Update the ID-based map for the gradient hooks
+                    if self_mem.sacred_mask[name].any():
+                        self_mem.param_id_to_mask[id(p)] = self_mem.sacred_mask[name].to(p.device)
+                        protected_this_call += self_mem.sacred_mask[name].sum().item()
+
+            self_mem.saturation_level = protected_this_call / num_total if num_total > 0 else 0.0
             print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
 
         model.memory._update_sacred_core = types.MethodType(dynamic_id_update, model.memory)
@@ -191,9 +184,9 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         def get_id_sentinel_hook(p_obj, mem_obj):
             p_id = id(p_obj)
             def hook(grad):
-                if p_id in mem_obj.param_id_to_mask:
+                if hasattr(mem_obj, 'param_id_to_mask') and p_id in mem_obj.param_id_to_mask:
                     mask = mem_obj.param_id_to_mask[p_id].to(grad.device)
-                    # Surgical gradient shunting
+                    # Surgical gradient shunting: 0 for locked weights, 1 for free weights
                     return grad * (~mask)
                 return grad
             return hook
