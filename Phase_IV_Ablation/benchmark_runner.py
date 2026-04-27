@@ -4,6 +4,7 @@ import sys
 import os
 import torch
 import copy
+import types
 from torchvision.models import resnet18
 
 # Path setup to import from other phases and local framework
@@ -161,6 +162,9 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             k = max(1, min(k, num_total))
             threshold = torch.kthvalue(flat_imp, k).values.item()
 
+            # [V13.1] Robust Identity Check (Fixes shape mismatch crash)
+            backbone_param_ids = {id(bp) for bp in backbone.parameters()}
+
             protected_count = 0
             for p_id, imp in id_to_imp.items():
                 mask = (imp >= threshold).bool()
@@ -173,7 +177,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     self_mem.param_id_to_mask[p_id] = mask.to(p.device)
                 
                 # Update string-based sacred_mask for framework compatibility (Backbone Only)
-                if p in backbone.parameters():
+                if p_id in backbone_param_ids:
                     # Find name in backbone
                     for name, bp in backbone.named_parameters():
                         if bp is p:
