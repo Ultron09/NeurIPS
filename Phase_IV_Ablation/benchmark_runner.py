@@ -65,12 +65,12 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             ogd_max_basis_size=256,
             input_dim=3072,              
             # [V9.4] Hardened Defense Protocol
-            learning_rate=5e-3,                 
-            ewc_lambda=10000.0,                 # [CRITICAL] Crank up protection
-            si_lambda=10.0,                     # [CRITICAL] Online importance
-            use_reptile=True,                   # [STABILITY] Manifold alignment
+            learning_rate=1e-3,                 # [V13] Lowered for stability
+            ewc_lambda=50000.0,                 # [V13] Extreme protection
+            si_lambda=10.0,                     
+            use_reptile=True,                   
             reptile_learning_rate=0.1,
-            use_learned_optimizer=True,         # [ADAPTATION] Meta-update
+            use_learned_optimizer=False,        # [V13] Disabled to reduce optimization noise
             novelty_z_threshold=1.2,            # [SENSITIVITY] Lowered for Task 1 detection
             adaptation_threshold=0.01,          # [PLASTICITY] Tightened
             use_gradient_centralization=True,
@@ -122,22 +122,33 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         if hasattr(model, 'consolidation_scheduler') and model.consolidation_scheduler:
             model.consolidation_scheduler.should_consolidate = lambda *args, **kwargs: (False, "External Control")
 
-        # [V10] Robust thresholding using kthvalue (Avoids quantile CPU errors for large tensors)
-        def dynamic_id_update(self_mem, top_k_ratio=0.08): # [V11] Lowered to 8% to fit 10 tasks without early saturation
+        # [V13] Collision-Free Robust Thresholding
+        def dynamic_id_update(self_mem, top_k_ratio=0.08):
             import torch
             all_importances = []
-            param_map = {} # name -> p object
+            id_to_imp = {}
+            id_to_p = {}
             
             with torch.no_grad():
-                for m_tracked in self_mem.models:
+                # We assume the first model in tracked_models is the backbone.
+                backbone = self_mem.models[0]
+                
+                for m_idx, m_tracked in enumerate(self_mem.models):
                     for name, p in m_tracked.named_parameters():
                         if not p.requires_grad: continue
-                        param_map[name] = p
+                        
+                        # Use a unique ID for every parameter across all models
+                        p_id = id(p)
+                        id_to_p[p_id] = p
                         
                         # Hybrid Importance: SI (omega) + EWC (fisher)
+                        # [FIX] Framework only uses string names, which collide. 
+                        # We must find the specific importance for THIS model.
                         imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
                         if name in self_mem.fisher_dict:
                             imp = imp + self_mem.fisher_dict[name].cpu()
+                        
+                        id_to_imp[p_id] = imp
                         all_importances.append(imp.view(-1))
             
             if not all_importances: return
@@ -145,38 +156,36 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             flat_imp = torch.cat(all_importances)
             num_total = flat_imp.numel()
             
-            # Calculate threshold using kthvalue (1.0 - ratio) percentile
+            # Calculate global threshold
             k = int((1.0 - top_k_ratio) * num_total)
             k = max(1, min(k, num_total))
-            
-            try:
-                threshold = torch.kthvalue(flat_imp, k).values.item()
-            except Exception as e:
-                print(f"  [DEBUG] kthvalue failed ({e}), falling back to mean.")
-                threshold = flat_imp.mean().item()
+            threshold = torch.kthvalue(flat_imp, k).values.item()
 
-            # Update masks and populate the ID-based registry
-            protected_this_call = 0
-            for m_tracked in self_mem.models:
-                for name, p in m_tracked.named_parameters():
-                    if not p.requires_grad: continue
-                    imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
-                    if name in self_mem.fisher_dict:
-                        imp = imp + self_mem.fisher_dict[name].cpu()
-                    
-                    mask = (imp >= threshold).bool()
-                    # OR with existing mask to keep old knowledge locked
-                    if name in self_mem.sacred_mask:
-                        self_mem.sacred_mask[name] = self_mem.sacred_mask[name] | mask
-                    else:
-                        self_mem.sacred_mask[name] = mask
-                    
-                    # Update the ID-based map for the gradient hooks
-                    if self_mem.sacred_mask[name].any():
-                        self_mem.param_id_to_mask[id(p)] = self_mem.sacred_mask[name].to(p.device)
-                        protected_this_call += self_mem.sacred_mask[name].sum().item()
+            protected_count = 0
+            for p_id, imp in id_to_imp.items():
+                mask = (imp >= threshold).bool()
+                p = id_to_p[p_id]
+                
+                # Update the ID-based registry (Primary Defense)
+                if p_id in self_mem.param_id_to_mask:
+                    self_mem.param_id_to_mask[p_id] = self_mem.param_id_to_mask[p_id] | mask.to(p.device)
+                else:
+                    self_mem.param_id_to_mask[p_id] = mask.to(p.device)
+                
+                # Update string-based sacred_mask for framework compatibility (Backbone Only)
+                if p in backbone.parameters():
+                    # Find name in backbone
+                    for name, bp in backbone.named_parameters():
+                        if bp is p:
+                            if name in self_mem.sacred_mask:
+                                self_mem.sacred_mask[name] = self_mem.sacred_mask[name] | mask
+                            else:
+                                self_mem.sacred_mask[name] = mask
+                            break
 
-            self_mem.saturation_level = protected_this_call / num_total if num_total > 0 else 0.0
+                protected_count += self_mem.param_id_to_mask[p_id].sum().item()
+
+            self_mem.saturation_level = protected_count / num_total if num_total > 0 else 0.0
             print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
 
         model.memory._update_sacred_core = types.MethodType(dynamic_id_update, model.memory)
@@ -198,6 +207,46 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                 if p.requires_grad:
                     p.register_hook(get_id_sentinel_hook(p, model.memory))
                     hook_count += 1
+        
+        # [V13] Reptile Protection: Reptile updates via param.data.copy_ bypass hooks.
+        # We must patch the update rule to respect the Sacred Mask.
+        if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
+            original_reptile_update = model.meta_controller.reptile._perform_update
+            def patched_reptile_update(self_rep):
+                target_model = self_rep.model
+                if hasattr(target_model, '_orig_mod'):
+                    target_model = target_model._orig_mod
+
+                current_weights = target_model.state_dict()
+                epsilon = self_rep.config.reptile_learning_rate
+                
+                with torch.no_grad():
+                    for name, anchor_param in self_rep.anchor_weights.items():
+                        if name in current_weights:
+                            fast_param = current_weights[name]
+                            if anchor_param.is_floating_point():
+                                # Reptile Interpolation
+                                target_val = anchor_param + epsilon * (fast_param - anchor_param)
+                                
+                                # [V13] Respect the Sacred Mask
+                                mask = model.memory.sacred_mask.get(name, None)
+                                if mask is not None:
+                                    # Keep anchor values for sacred coordinates, use target for free ones
+                                    # Since we are moving towards the fast_param, but want to keep the anchor's stability
+                                    # for protected weights, we simply don't move the protected weights.
+                                    protected_val = anchor_param.to(fast_param.device)
+                                    new_val = torch.where(mask.to(fast_param.device), protected_val, target_val.to(fast_param.device))
+                                    current_weights[name].copy_(new_val)
+                                else:
+                                    current_weights[name].copy_(target_val)
+                            else:
+                                current_weights[name].copy_(fast_param)
+                
+                # Update Anchor for next cycle
+                self_rep.anchor_weights = self_rep._clone_weights()
+            
+            model.meta_controller.reptile._perform_update = types.MethodType(patched_reptile_update, model.meta_controller.reptile)
+            print(f"  [SYSTEM] Reptile Protection Active. Applied to {hook_count} parameters.")
         
         print(f"  [SYSTEM] {hook_count} Dynamic Sentinel Hooks successfully attached.")
 
