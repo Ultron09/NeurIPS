@@ -119,6 +119,9 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         
         model.forward = types.MethodType(patched_forward, model)
 
+        # [V14] Shunt Autonomic Health Monitor (Stop nuking locked neurons)
+        model.health_monitor = None
+        
         # [V10] Disable Framework Auto-Consolidation to prevent interference during epochs
         if hasattr(model, 'consolidation_scheduler') and model.consolidation_scheduler:
             model.consolidation_scheduler.should_consolidate = lambda *args, **kwargs: (False, "External Control")
@@ -161,6 +164,10 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             k = int((1.0 - top_k_ratio) * num_total)
             k = max(1, min(k, num_total))
             threshold = torch.kthvalue(flat_imp, k).values.item()
+            
+            # [V14] Threshold Safety Floor: If threshold is 0, only lock non-zero importances.
+            # This prevents 100% saturation when a task has sparse gradients.
+            threshold = max(threshold, 1e-9)
 
             # [V13.1] Robust Identity Check (Fixes shape mismatch crash)
             backbone_param_ids = {id(bp) for bp in backbone.parameters()}
@@ -282,24 +289,21 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             print(f"\n[ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
             model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
             
-            # Recompute saturation
-            total_sacred = sum(m.sum().item() for m in model.memory.sacred_mask.values())
+            # [V14] Recompute saturation accurately (Unified Registry)
+            total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
             num_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
             model.memory.saturation_level = total_sacred / num_total
             print(f"  [SENTIENT] Knowledge Anchored. Locked Parameters: {total_sacred:,} / {num_total:,} ({model.memory.saturation_level:.2%})")
             
-            # [PLASTICITY RESTORATION] Safety Valve (Raised to 85% for NeurIPS 10-Task stability)
-            if model.memory.saturation_level > 0.85:
+            # [V14] Hardened Saturation Ceiling (95% Safety Valve)
+            if model.memory.saturation_level > 0.95:
                 print(f"  [SENTIENT] Critical Saturation ({model.memory.saturation_level:.2%}). Optimizing Mask...")
-                # [V11] Intelligent Pruning: Only keep the most critical overlaps if we hit absolute limit
-                # For now, we just log and allow it to continue to 95%
-                pass
-                
-                # Recompute saturation
-                total_sacred = sum(m.sum().item() for m in model.memory.sacred_mask.values())
-                num_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                model.memory.saturation_level = total_sacred / num_total
-                print(f"  [SENTIENT] Plasticity Restored. New Saturation: {model.memory.saturation_level:.2%}")
+                # Prune 5% of everything to breathe
+                for p_id in model.memory.param_id_to_mask:
+                    mask = model.memory.param_id_to_mask[p_id]
+                    prune_mask = torch.rand_like(mask.float()) > 0.05
+                    model.memory.param_id_to_mask[p_id] = mask & prune_mask.to(mask.device)
+                print(f"  [SENTIENT] Plasticity Restored.")
 
         # Unified Evaluation Autopsy
         evaluate_suite(model, curriculum, t_idx, metrics, device=device, hat_module=hat_module)
