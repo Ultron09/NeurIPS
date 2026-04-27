@@ -39,7 +39,7 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                 # ============================================================
                 try:
                     result = model.train_step(x, target_data=y,
-                                              task_id=str(t_idx), 
+                                              task_id=t_idx, 
                                               enable_dream=True,
                                               meta_step=True,
                                               record_stats=True)

@@ -28,11 +28,13 @@ def evaluate_suite(model, curriculum, t_idx, metrics_engine: MetricsEngine, devi
                 if is_antara:
                     # ANTARA COGNITIVE PATH
                     try:
-                        logits = model.inference_step(x)
+                        # [V11] CRITICAL: Pass task_id for correct MoE routing during evaluation
+                        logits = model.inference_step(x, task_id=eval_task_idx)
                         if isinstance(logits, tuple):
                             logits = logits[0]
                     except Exception:
-                        out = model(x)
+                        # [V11] Fallback also needs task_id propagation
+                        out = model(x, task_id=eval_task_idx)
                         logits = out[0] if isinstance(out, tuple) else out
                 else:
                     # BASELINE PATH
