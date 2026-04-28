@@ -344,6 +344,15 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                   f"Locked Parameters: {total_sacred:,.0f} / {num_total:,} "
                   f"({model.memory.saturation_level:.2%})")
 
+            # [V17] Reset Lookahead slow_weights to current post-consolidation state.
+            # Prevents stale slow weights from overwriting sacred coordinates.
+            if hasattr(model, 'slow_weights') and model.config.use_lookahead:
+                model.slow_weights = {
+                    n: p.data.clone().detach().cpu()
+                    for n, p in model.model.named_parameters()
+                    if p.requires_grad
+                }
+
         evaluate_suite(model, curriculum, t_idx, metrics, device=device, hat_module=hat_module)
 
     # =========================================================================
