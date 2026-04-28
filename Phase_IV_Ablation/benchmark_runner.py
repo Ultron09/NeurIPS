@@ -28,10 +28,10 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     set_seed(seed)
     device = setup_compute(device_str)
     full_method_name = f"{method_name}{suffix}_seed{seed}"
-    
+
     print(f"\n[NEURIPS GAUNTLET] Executing Branch: {full_method_name}")
     print(f"  [SYSTEM] Active Compute Device: {device}")
-    
+
     if wandb_sync:
         import wandb
         wandb.init(project=project, entity=entity, name=full_method_name, config={
@@ -40,14 +40,12 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             "device": str(device)
         })
 
-    # Initialize model and components
     def model_factory():
         return resnet18(num_classes=100)
-        
+
     curriculum = SplitCIFAR100(pin_memory=(device.type == "cuda"))
     model = model_factory().to(device)
-    
-    # Branch config
+
     ewc_module = None
     replay_buffer = None
     agem_module = None
@@ -61,19 +59,18 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             num_experts=10,
             top_k_experts=1,
             use_moe=True,
-            use_hierarchical_moe=True,   
-            use_ogd=True,                
+            use_hierarchical_moe=True,
+            use_ogd=True,
             ogd_max_basis_size=256,
-            input_dim=3072,              
-            # [V9.4] Hardened Defense Protocol
-            learning_rate=1e-3,                 # [V13] Lowered for stability
-            ewc_lambda=50000.0,                 # [V13] Extreme protection
-            si_lambda=10.0,                     
-            use_reptile=True,                   
+            input_dim=3072,
+            learning_rate=1e-3,
+            ewc_lambda=50000.0,
+            si_lambda=10.0,
+            use_reptile=True,
             reptile_learning_rate=0.1,
-            use_learned_optimizer=False,        # [V13] Disabled to reduce optimization noise
-            novelty_z_threshold=1.2,            # [SENSITIVITY] Lowered for Task 1 detection
-            adaptation_threshold=0.01,          # [PLASTICITY] Tightened
+            use_learned_optimizer=False,
+            novelty_z_threshold=1.2,
+            adaptation_threshold=0.01,
             use_gradient_centralization=True,
             use_lookahead=True
         )
@@ -94,242 +91,274 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         raise ValueError(f"Invalid experiment method: {method_name}")
 
     is_antara = method_name.startswith("ANTARA")
-    
-    # [MONKEY-PATCH] Fix the 100% Saturation Bug in V9.4
+
+    # =========================================================================
+    # [MONKEY-PATCH] Neuro-Stability V15 IRON MIND
+    # Root causes fixed:
+    #   A. Per-task quota: each task locks top-8% independently (no dilution)
+    #   B. Force-lock FC head rows for all past tasks (hard classification guarantee)
+    #   C. Anchor re-sync after consolidation (fixes SI omega poisoning from best_model restore)
+    #   D. No-op _update_sacred_core (we call our own V15 updater instead)
+    #   E. Shunt Autonomic Health Monitor (stops nuking locked neurons)
+    # =========================================================================
     if is_antara:
-        import types
-        print("  [SYSTEM] Initializing Neuro-Stability V10...")
+        print("  [SYSTEM] Initializing Neuro-Stability V15 IRON MIND...")
 
-        # [V10] Live Protection Registry
-        model.memory.param_id_to_mask = {}
+        # Primary registries
+        model.memory.param_id_to_mask = {}     # id(p) -> bool mask on device(p)
+        model.memory.task_omega_snapshots = {} # task_id -> {p_id -> CPU importance tensor}
 
-        # [V10] MoE Propagation Fix: Patch AdaptiveFramework.forward to pass task_id
-        # This is CRITICAL to prevent Task 1 training from destroying Expert 0
-        original_forward = model.forward
-        def patched_forward(self_fw, *args, **kwargs):
-            t_id = kwargs.get('task_id')
-            if t_id is None:
-                t_id = getattr(self_fw, '_current_task_id', None)
-            
-            # If task_id is found, ensure it's in kwargs for the underlying Experts
+        # [V14] Kill Autonomic Health Monitor
+        model.health_monitor = None
+
+        # Disable framework's auto-consolidation
+        if hasattr(model, 'consolidation_scheduler') and model.consolidation_scheduler:
+            model.consolidation_scheduler.should_consolidate = lambda *a, **k: (False, "External Control")
+
+        # MoE task_id propagation fix
+        _orig_fwd = model.forward
+        def _patched_forward(self_fw, *args, **kwargs):
+            t_id = kwargs.get('task_id') or getattr(self_fw, '_current_task_id', None)
             if t_id is not None:
                 kwargs['task_id'] = t_id
-                
-            return original_forward(*args, **kwargs)
-        
-        model.forward = types.MethodType(patched_forward, model)
+            return _orig_fwd(*args, **kwargs)
+        model.forward = types.MethodType(_patched_forward, model)
 
-        # [V14] Shunt Autonomic Health Monitor (Stop nuking locked neurons)
-        model.health_monitor = None
-        
-        # [V10] Disable Framework Auto-Consolidation to prevent interference during epochs
-        if hasattr(model, 'consolidation_scheduler') and model.consolidation_scheduler:
-            model.consolidation_scheduler.should_consolidate = lambda *args, **kwargs: (False, "External Control")
+        # Replace framework's internal sacred core updater with a no-op
+        # (V15 calls our own updater after consolidation)
+        model.memory._update_sacred_core = lambda *a, **k: None
 
-        # [V13] Collision-Free Robust Thresholding
-        def dynamic_id_update(self_mem, top_k_ratio=0.08):
-            import torch
-            all_importances = []
-            id_to_imp = {}
-            id_to_p = {}
-            
+        # -----------------------------------------------------------------
+        # [V15] PER-TASK QUOTA UPDATE
+        # -----------------------------------------------------------------
+        def _v15_update(mem, task_id, backbone_ref):
+            """
+            1. Snapshot current task's importance (SI omega + EWC Fisher).
+            2. Rebuild cumulative mask as UNION of per-task top-8% masks.
+            3. Hard-lock FC head rows for every completed task.
+            4. Commit to param_id_to_mask and sacred_mask.
+            """
+            PER_TASK_QUOTA = 0.08
+
+            id_to_p   = {}  # p_id -> (name, tensor)
+            id_to_imp = {}  # p_id -> importance tensor (CPU)
+
             with torch.no_grad():
-                # We assume the first model in tracked_models is the backbone.
-                backbone = self_mem.models[0]
-                
-                for m_idx, m_tracked in enumerate(self_mem.models):
+                for m_tracked in mem.models:
                     for name, p in m_tracked.named_parameters():
-                        if not p.requires_grad: continue
-                        
-                        # Use a unique ID for every parameter across all models
+                        if not p.requires_grad:
+                            continue
                         p_id = id(p)
-                        id_to_p[p_id] = p
-                        
-                        # Hybrid Importance: SI (omega) + EWC (fisher)
-                        # [FIX] Framework only uses string names, which collide. 
-                        # We must find the specific importance for THIS model.
-                        imp = self_mem.omega.get(name, torch.zeros_like(p).cpu())
-                        if name in self_mem.fisher_dict:
-                            imp = imp + self_mem.fisher_dict[name].cpu()
-                        
-                        id_to_imp[p_id] = imp
-                        all_importances.append(imp.view(-1))
-            
-            if not all_importances: return
-            
-            flat_imp = torch.cat(all_importances)
-            num_total = flat_imp.numel()
-            
-            # Calculate global threshold
-            k = int((1.0 - top_k_ratio) * num_total)
-            k = max(1, min(k, num_total))
-            threshold = torch.kthvalue(flat_imp, k).values.item()
-            
-            # [V14] Threshold Safety Floor: If threshold is 0, only lock non-zero importances.
-            # This prevents 100% saturation when a task has sparse gradients.
-            threshold = max(threshold, 1e-9)
+                        id_to_p[p_id] = (name, p)
+                        curr = mem.omega.get(name, torch.zeros_like(p).cpu()).clone()
+                        if name in mem.fisher_dict:
+                            curr = curr + mem.fisher_dict[name].cpu()
+                        id_to_imp[p_id] = curr
 
-            # [V13.1] Robust Identity Check (Fixes shape mismatch crash)
-            backbone_param_ids = {id(bp) for bp in backbone.parameters()}
+            if not id_to_imp:
+                return
 
-            protected_count = 0
-            for p_id, imp in id_to_imp.items():
-                mask = (imp >= threshold).bool()
-                p = id_to_p[p_id]
-                
-                # Update the ID-based registry (Primary Defense)
-                if p_id in self_mem.param_id_to_mask:
-                    self_mem.param_id_to_mask[p_id] = self_mem.param_id_to_mask[p_id] | mask.to(p.device)
-                else:
-                    self_mem.param_id_to_mask[p_id] = mask.to(p.device)
-                
-                # Update string-based sacred_mask for framework compatibility (Backbone Only)
-                if p_id in backbone_param_ids:
-                    # Find name in backbone
-                    for name, bp in backbone.named_parameters():
-                        if bp is p:
-                            if name in self_mem.sacred_mask:
-                                self_mem.sacred_mask[name] = self_mem.sacred_mask[name] | mask
-                            else:
-                                self_mem.sacred_mask[name] = mask
-                            break
+            # Store snapshot for this task
+            mem.task_omega_snapshots[task_id] = {
+                pid: imp.clone() for pid, imp in id_to_imp.items()
+            }
 
-                protected_count += self_mem.param_id_to_mask[p_id].sum().item()
+            # Rebuild union mask from all task snapshots
+            cumulative = {}
+            for tid, snap in mem.task_omega_snapshots.items():
+                flat = torch.cat([v.view(-1) for v in snap.values()])
+                n = flat.numel()
+                k = max(1, min(int((1.0 - PER_TASK_QUOTA) * n), n - 1))
+                thr = max(torch.kthvalue(flat, k).values.item(), 1e-9)
+                for pid, imp in snap.items():
+                    m = (imp >= thr).bool()
+                    cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
 
-            self_mem.saturation_level = protected_count / num_total if num_total > 0 else 0.0
-            print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {self_mem.saturation_level:.2%}")
+            # Hard-lock FC head rows for all completed tasks
+            fc = getattr(backbone_ref, 'fc', None)
+            if fc is not None:
+                fc_w_id = id(fc.weight)
+                if fc_w_id not in cumulative:
+                    cumulative[fc_w_id] = torch.zeros(fc.weight.shape, dtype=torch.bool)
+                for tid in mem.task_omega_snapshots:
+                    s, e = tid * 10, min((tid + 1) * 10, fc.weight.shape[0])
+                    cumulative[fc_w_id][s:e, :] = True
 
-        model.memory._update_sacred_core = types.MethodType(dynamic_id_update, model.memory)
+                if fc.bias is not None:
+                    fc_b_id = id(fc.bias)
+                    if fc_b_id not in cumulative:
+                        cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool)
+                    for tid in mem.task_omega_snapshots:
+                        s, e = tid * 10, min((tid + 1) * 10, fc.bias.shape[0])
+                        cumulative[fc_b_id][s:e] = True
 
-        def get_id_sentinel_hook(p_obj, mem_obj):
-            p_id = id(p_obj)
+            # Commit masks
+            mem.param_id_to_mask = {}
+            backbone_ids = {id(p): nm for nm, p in backbone_ref.named_parameters()}
+
+            protected = 0
+            total_n   = 0
+
+            # Helper to resolve tensor from p_id
+            def _resolve(pid):
+                if pid in id_to_p:
+                    return id_to_p[pid][1]
+                if fc is not None:
+                    if pid == id(fc.weight):
+                        return fc.weight
+                    if fc.bias is not None and pid == id(fc.bias):
+                        return fc.bias
+                return None
+
+            for pid, mask in cumulative.items():
+                tensor = _resolve(pid)
+                if tensor is None:
+                    continue
+                mem.param_id_to_mask[pid] = mask.to(tensor.device)
+                protected += mask.sum().item()
+                total_n   += mask.numel()
+                # Sync sacred_mask for backbone (used by Reptile)
+                if pid in backbone_ids:
+                    mem.sacred_mask[backbone_ids[pid]] = mask
+
+            mem.saturation_level = protected / total_n if total_n > 0 else 0.0
+            print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {mem.saturation_level:.2%}")
+
+        model.memory._v15_update = _v15_update
+
+        # -----------------------------------------------------------------
+        # Gradient Sentinel Hooks — zero grad for locked params
+        # -----------------------------------------------------------------
+        def _make_hook(p_id, mem):
             def hook(grad):
-                if hasattr(mem_obj, 'param_id_to_mask') and p_id in mem_obj.param_id_to_mask:
-                    mask = mem_obj.param_id_to_mask[p_id].to(grad.device)
-                    # Surgical gradient shunting: 0 for locked weights, 1 for free weights
-                    return grad * (~mask)
+                m = mem.param_id_to_mask.get(p_id)
+                if m is not None:
+                    return grad * (~m.to(grad.device))
                 return grad
             return hook
 
-        # Register hooks on ALL parameters of ALL tracked models
         hook_count = 0
         for tracked_model in model.memory.models:
             for p in tracked_model.parameters():
                 if p.requires_grad:
-                    p.register_hook(get_id_sentinel_hook(p, model.memory))
+                    p.register_hook(_make_hook(id(p), model.memory))
                     hook_count += 1
-        
-        # [V13] Reptile Protection: Reptile updates via param.data.copy_ bypass hooks.
-        # We must patch the update rule to respect the Sacred Mask.
+
+        # -----------------------------------------------------------------
+        # Reptile Protection — bypass data.copy_ for sacred weights
+        # -----------------------------------------------------------------
         if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
-            original_reptile_update = model.meta_controller.reptile._perform_update
-            def patched_reptile_update(self_rep):
-                target_model = self_rep.model
-                if hasattr(target_model, '_orig_mod'):
-                    target_model = target_model._orig_mod
-
-                current_weights = target_model.state_dict()
-                epsilon = self_rep.config.reptile_learning_rate
-                
+            def _patched_reptile(self_rep):
+                tgt = self_rep.model
+                if hasattr(tgt, '_orig_mod'):
+                    tgt = tgt._orig_mod
+                cw  = tgt.state_dict()
+                eps = self_rep.config.reptile_learning_rate
                 with torch.no_grad():
-                    for name, anchor_param in self_rep.anchor_weights.items():
-                        if name in current_weights:
-                            fast_param = current_weights[name]
-                            if anchor_param.is_floating_point():
-                                # Reptile Interpolation
-                                target_val = anchor_param + epsilon * (fast_param - anchor_param)
-                                
-                                # [V13] Respect the Sacred Mask
-                                mask = model.memory.sacred_mask.get(name, None)
-                                if mask is not None:
-                                    # Keep anchor values for sacred coordinates, use target for free ones
-                                    # Since we are moving towards the fast_param, but want to keep the anchor's stability
-                                    # for protected weights, we simply don't move the protected weights.
-                                    protected_val = anchor_param.to(fast_param.device)
-                                    new_val = torch.where(mask.to(fast_param.device), protected_val, target_val.to(fast_param.device))
-                                    current_weights[name].copy_(new_val)
-                                else:
-                                    current_weights[name].copy_(target_val)
+                    for name, anc in self_rep.anchor_weights.items():
+                        if name not in cw:
+                            continue
+                        fast = cw[name]
+                        if anc.is_floating_point():
+                            tv   = anc + eps * (fast - anc)
+                            mask = model.memory.sacred_mask.get(name)
+                            if mask is not None:
+                                cw[name].copy_(torch.where(
+                                    mask.to(fast.device),
+                                    anc.to(fast.device),
+                                    tv.to(fast.device)
+                                ))
                             else:
-                                current_weights[name].copy_(fast_param)
-                
-                # Update Anchor for next cycle
+                                cw[name].copy_(tv)
+                        else:
+                            cw[name].copy_(fast)
                 self_rep.anchor_weights = self_rep._clone_weights()
-            
-            model.meta_controller.reptile._perform_update = types.MethodType(patched_reptile_update, model.meta_controller.reptile)
-            print(f"  [SYSTEM] Reptile Protection Active. Applied to {hook_count} parameters.")
-        
-        print(f"  [SYSTEM] {hook_count} Dynamic Sentinel Hooks successfully attached.")
+            model.meta_controller.reptile._perform_update = types.MethodType(
+                _patched_reptile, model.meta_controller.reptile
+            )
+            print("  [SYSTEM] Reptile Protection Active.")
 
+        print(f"  [SYSTEM] {hook_count} Sentinel Hooks attached. V15 IRON MIND Online.")
+
+    # =========================================================================
+    # MAIN TRAINING LOOP
+    # =========================================================================
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-    metrics = MetricsEngine(num_tasks=10, config_name=full_method_name)
-    total_start_time = time.time()
-    task_step_times = []
+    metrics   = MetricsEngine(num_tasks=10, config_name=full_method_name)
+    total_start_time  = time.time()
+    task_step_times   = []
 
-    # Main Curriculum Loop
+    _backbone_ref = model.memory.models[0] if is_antara else None
+
     for t_idx in range(10):
         train_loader, val_loader, _ = curriculum.get_task(t_idx)
-        
-        # Unified Training Logic
-        avg_step_time = train_single_task(model, train_loader, val_loader, optimizer, t_idx, 
-                                          device=device, ewc_module=ewc_module, 
-                                          agem_module=agem_module, replay_buffer=replay_buffer,
-                                          der_module=der_module, hat_module=hat_module,
-                                          epochs=10)
+
+        avg_step_time = train_single_task(
+            model, train_loader, val_loader, optimizer, t_idx,
+            device=device, ewc_module=ewc_module,
+            agem_module=agem_module, replay_buffer=replay_buffer,
+            der_module=der_module, hat_module=hat_module,
+            epochs=10
+        )
         task_step_times.append(avg_step_time)
-        
-        # Post-task anchoring
+
         if method_name == "EWC":
             ewc_module.save_task_weights(train_loader, device=device)
         elif method_name == "HAT":
             hat_module.update_cumulative_mask(t_idx)
-            
-        # Post-task memory consolidation (V9.4 Eternal Protocol)
+
         if is_antara:
             print(f"\n[ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
             model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
-            
-            # [V14] Recompute saturation accurately (Unified Registry)
-            total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
-            num_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            model.memory.saturation_level = total_sacred / num_total
-            print(f"  [SENTIENT] Knowledge Anchored. Locked Parameters: {total_sacred:,} / {num_total:,} ({model.memory.saturation_level:.2%})")
-            
-            # [V14] Hardened Saturation Ceiling (95% Safety Valve)
-            if model.memory.saturation_level > 0.95:
-                print(f"  [SENTIENT] Critical Saturation ({model.memory.saturation_level:.2%}). Optimizing Mask...")
-                # Prune 5% of everything to breathe
-                for p_id in model.memory.param_id_to_mask:
-                    mask = model.memory.param_id_to_mask[p_id]
-                    prune_mask = torch.rand_like(mask.float()) > 0.05
-                    model.memory.param_id_to_mask[p_id] = mask & prune_mask.to(mask.device)
-                print(f"  [SENTIENT] Plasticity Restored.")
 
-        # Unified Evaluation Autopsy
+            # [V15 Fix C] Re-sync SI anchor to current params AFTER consolidation.
+            # trainer.py restores best_model via load_state_dict, then consolidation runs
+            # with those weights. After consolidation the anchor is still the pre-training
+            # checkpoint. Reset it now so the next task's SI computes relative to the
+            # actual post-consolidation weights.
+            with torch.no_grad():
+                for m_tracked in model.memory.models:
+                    for name, p in m_tracked.named_parameters():
+                        if p.requires_grad:
+                            model.memory.anchor[name] = p.data.clone().detach().cpu()
+
+            # Per-task quota mask rebuild + head force-lock
+            model.memory._v15_update(model.memory, t_idx, _backbone_ref)
+
+            total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
+            num_total    = sum(p.numel() for p in _backbone_ref.parameters() if p.requires_grad)
+            model.memory.saturation_level = total_sacred / num_total
+            print(f"  [SENTIENT] Knowledge Anchored. "
+                  f"Locked Parameters: {total_sacred:,.0f} / {num_total:,} "
+                  f"({model.memory.saturation_level:.2%})")
+
         evaluate_suite(model, curriculum, t_idx, metrics, device=device, hat_module=hat_module)
-        
-    # Finalize
+
+    # =========================================================================
+    # FINALIZE
+    # =========================================================================
     total_duration = time.time() - total_start_time
-    metrics.avg_step_time_ms = (sum(task_step_times)/len(task_step_times)) * 1000
-    metrics.total_compute_time_sec = total_duration
+    metrics.avg_step_time_ms        = (sum(task_step_times) / len(task_step_times)) * 1000
+    metrics.total_compute_time_sec  = total_duration
     if device.type == "cuda":
         metrics.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-        
+
     results_path = f"results/{full_method_name}_metrics.json"
     metrics.save_results(results_path)
     metrics.plot_heatmap(f"results/{full_method_name}_heatmap.png")
     metrics.generate_summary_report()
-    
+
     print(f"\n[GAUNTLET COMPLETE] Method: {full_method_name}")
     print(f"  Total Duration: {total_duration/60:.2f} minutes")
     print(f"  Avg Step Time: {sum(task_step_times)/len(task_step_times):.4f}s")
-    
+
     if wandb_sync:
         wandb.finish()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", type=str, required=True, choices=["ANTARA_FULL", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE"])
+    parser.add_argument("--method", type=str, required=True,
+                        choices=["ANTARA_FULL", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb", action="store_true")
@@ -337,5 +366,5 @@ if __name__ == "__main__":
     parser.add_argument("--entity", type=str, default="ultron09-airbornehrs")
     parser.add_argument("--suffix", type=str, default="")
     args = parser.parse_args()
-    
+
     run_experiment(args.method, args.device, args.wandb, args.project, args.entity, args.suffix, args.seed)
