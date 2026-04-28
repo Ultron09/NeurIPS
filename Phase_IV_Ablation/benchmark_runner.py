@@ -138,7 +138,8 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             3. Hard-lock FC head rows for all past tasks.
             4. Hard-lock Gating network rows for all past tasks.
             """
-            PER_TASK_QUOTA = 0.15 # Increased for higher stability
+            # --- [V17] UNYIELDING SOUL: QUOTA INCREASE ---
+            PER_TASK_QUOTA = 0.25 # Increased from 0.15 for maximum retention
 
             id_to_p   = {} 
             id_to_imp = {}
