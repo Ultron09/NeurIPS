@@ -310,7 +310,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
 
     _backbone_ref = model.memory.models[0] if is_antara else None
 
-    for t_idx in range(10):
+    for t_idx in range(2):
         train_loader, val_loader, _ = curriculum.get_task(t_idx)
 
         avg_step_time = train_single_task(
@@ -318,7 +318,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             device=device, ewc_module=ewc_module,
             agem_module=agem_module, replay_buffer=replay_buffer,
             der_module=der_module, hat_module=hat_module,
-            epochs=10
+            epochs=1
         )
         task_step_times.append(avg_step_time)
 
