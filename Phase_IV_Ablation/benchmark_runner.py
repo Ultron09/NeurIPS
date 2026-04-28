@@ -129,19 +129,19 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         model.memory._update_sacred_core = lambda *a, **k: None
 
         # -----------------------------------------------------------------
-        # [V15] PER-TASK QUOTA UPDATE
+        # [V16] TITAN SOUL: PER-TASK QUOTA UPDATE
         # -----------------------------------------------------------------
-        def _v15_update(mem, task_id, backbone_ref):
+        def _v16_update(mem, task_id, backbone_ref):
             """
-            1. Snapshot current task's importance (SI omega + EWC Fisher).
-            2. Rebuild cumulative mask as UNION of per-task top-8% masks.
-            3. Hard-lock FC head rows for every completed task.
-            4. Commit to param_id_to_mask and sacred_mask.
+            1. Snapshot current task's importance.
+            2. Rebuild cumulative mask as UNION of per-task top-15% masks.
+            3. Hard-lock FC head rows for all past tasks.
+            4. Hard-lock Gating network rows for all past tasks.
             """
-            PER_TASK_QUOTA = 0.08
+            PER_TASK_QUOTA = 0.15 # Increased for higher stability
 
-            id_to_p   = {}  # p_id -> (name, tensor)
-            id_to_imp = {}  # p_id -> importance tensor (CPU)
+            id_to_p   = {} 
+            id_to_imp = {}
 
             with torch.no_grad():
                 for m_tracked in mem.models:
@@ -158,12 +158,10 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             if not id_to_imp:
                 return
 
-            # Store snapshot for this task
             mem.task_omega_snapshots[task_id] = {
                 pid: imp.clone() for pid, imp in id_to_imp.items()
             }
 
-            # Rebuild union mask from all task snapshots
             cumulative = {}
             for tid, snap in mem.task_omega_snapshots.items():
                 flat = torch.cat([v.view(-1) for v in snap.values()])
@@ -174,7 +172,8 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     m = (imp >= thr).bool()
                     cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
 
-            # Hard-lock FC head rows for all completed tasks
+            # --- HARD GUARANTEES ---
+            # 1. FC Head
             fc = getattr(backbone_ref, 'fc', None)
             if fc is not None:
                 fc_w_id = id(fc.weight)
@@ -183,7 +182,6 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                 for tid in mem.task_omega_snapshots:
                     s, e = tid * 10, min((tid + 1) * 10, fc.weight.shape[0])
                     cumulative[fc_w_id][s:e, :] = True
-
                 if fc.bias is not None:
                     fc_b_id = id(fc.bias)
                     if fc_b_id not in cumulative:
@@ -192,39 +190,53 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                         s, e = tid * 10, min((tid + 1) * 10, fc.bias.shape[0])
                         cumulative[fc_b_id][s:e] = True
 
+            # 2. MoE Gating Network
+            # HierarchicalMoE usually has a .gate or .domain_gate
+            for m_tracked in mem.models:
+                for name, module in m_tracked.named_modules():
+                    if "gate" in name.lower() and hasattr(module, 'weight'):
+                        g_id = id(module.weight)
+                        if g_id not in cumulative:
+                            cumulative[g_id] = torch.zeros(module.weight.shape, dtype=torch.bool)
+                        for tid in mem.task_omega_snapshots:
+                            # If gate has experts as output dim
+                            if module.weight.shape[0] >= 10:
+                                target = tid % module.weight.shape[0]
+                                cumulative[g_id][target, :] = True
+
             # Commit masks
             mem.param_id_to_mask = {}
-            backbone_ids = {id(p): nm for nm, p in backbone_ref.named_parameters()}
+            
+            # Build global name lookup across all tracked models
+            all_names = {}
+            for m_tracked in mem.models:
+                for name, p in m_tracked.named_parameters():
+                    all_names[id(p)] = name
 
             protected = 0
             total_n   = 0
 
-            # Helper to resolve tensor from p_id
-            def _resolve(pid):
-                if pid in id_to_p:
-                    return id_to_p[pid][1]
-                if fc is not None:
-                    if pid == id(fc.weight):
-                        return fc.weight
-                    if fc.bias is not None and pid == id(fc.bias):
-                        return fc.bias
-                return None
-
             for pid, mask in cumulative.items():
-                tensor = _resolve(pid)
-                if tensor is None:
-                    continue
+                tensor = None
+                # Check id_to_p (tracked params)
+                if pid in id_to_p:
+                    tensor = id_to_p[pid][1]
+                
+                if tensor is None: continue
+
                 mem.param_id_to_mask[pid] = mask.to(tensor.device)
                 protected += mask.sum().item()
                 total_n   += mask.numel()
-                # Sync sacred_mask for backbone (used by Reptile)
-                if pid in backbone_ids:
-                    mem.sacred_mask[backbone_ids[pid]] = mask
+                
+                # Sync sacred_mask by name
+                if pid in all_names:
+                    mem.sacred_mask[all_names[pid]] = mask
 
             mem.saturation_level = protected / total_n if total_n > 0 else 0.0
             print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {mem.saturation_level:.2%}")
 
-        model.memory._v15_update = _v15_update
+        model.memory._v16_update = _v16_update
+
 
         # -----------------------------------------------------------------
         # Gradient Sentinel Hooks — zero grad for locked params
@@ -322,8 +334,8 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                         if p.requires_grad:
                             model.memory.anchor[name] = p.data.clone().detach().cpu()
 
-            # Per-task quota mask rebuild + head force-lock
-            model.memory._v15_update(model.memory, t_idx, _backbone_ref)
+            # [V16] Per-task quota mask rebuild + head force-lock
+            model.memory._v16_update(model.memory, t_idx, _backbone_ref)
 
             total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
             num_total    = sum(p.numel() for p in _backbone_ref.parameters() if p.requires_grad)

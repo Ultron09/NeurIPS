@@ -45,8 +45,10 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                                               record_stats=True)
                     step_loss = result.get('total_loss', result.get('loss', 0.0))
                 except Exception as e:
+
                     print(f"  [ANTARA] train_step error at T{t_idx} E{epoch}: {e}")
                     step_loss = float('inf')
+
 
             else:
                 # ============================================================
