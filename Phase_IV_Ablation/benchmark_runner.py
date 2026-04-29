@@ -79,13 +79,13 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         config = AdaptiveFrameworkConfig(
             model_dim=256,
             num_experts=10,
-            top_k_experts=1,
+            top_k_experts=2,
             use_moe=True,
             use_hierarchical_moe=True,
             use_ogd=False,
             input_dim=3072,
-            learning_rate=1e-3,
-            ewc_lambda=150.0,
+            learning_rate=2e-3,
+            ewc_lambda=0.0,
             si_lambda=1.0,
             use_reptile=True,
             reptile_learning_rate=0.1,
@@ -100,14 +100,14 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         config = AdaptiveFrameworkConfig(
             model_dim=256,
             num_experts=10,
-            top_k_experts=1,
+            top_k_experts=2,
             use_moe=True,
             use_hierarchical_moe=True,
             use_ogd=True,
             ogd_max_basis_size=256,
             input_dim=3072,
-            learning_rate=1e-3,
-            ewc_lambda=150.0,
+            learning_rate=2e-3,
+            ewc_lambda=0.0,
             si_lambda=1.0,
             use_reptile=False,
             use_learned_optimizer=False,
@@ -474,7 +474,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", type=str, required=True,
-                        choices=["ANTARA_FULL", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE"])
+                        choices=["ANTARA_FULL", "ANTARA_RGW_ONLY", "ANTARA_OGD_ONLY", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb", action="store_true")
