@@ -151,9 +151,9 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                         p_id = id(p)
                         id_to_p[p_id] = (name, p)
                         # [V19] Get importance and ensure it is non-negative
-                        curr = mem.omega.get(name, torch.zeros_like(p).cpu()).clone()
+                        curr = mem.omega.get(name, torch.zeros_like(p)).clone()
                         if name in mem.fisher_dict:
-                            curr = curr + mem.fisher_dict[name].cpu()
+                            curr = curr + mem.fisher_dict[name]
                         id_to_imp[p_id] = curr.abs()
 
             if not id_to_imp:
@@ -202,7 +202,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             if fc is not None:
                 fc_w_id = id(fc.weight)
                 if fc_w_id not in cumulative:
-                    cumulative[fc_w_id] = torch.zeros(fc.weight.shape, dtype=torch.bool)
+                    cumulative[fc_w_id] = torch.zeros(fc.weight.shape, dtype=torch.bool, device=fc.weight.device)
                 
                 for tid in mem.task_omega_snapshots:
                     s, e = tid * 10, min((tid + 1) * 10, fc.weight.shape[0])
@@ -210,7 +210,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     if fc.bias is not None:
                         fc_b_id = id(fc.bias)
                         if fc_b_id not in cumulative:
-                            cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool)
+                            cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool, device=fc.bias.device)
                         cumulative[fc_b_id][s:e] = True
 
             # 2. MoE Gating Network: Lock the routing rows for all tasks
@@ -219,7 +219,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     if "gate" in name.lower() and hasattr(module, 'weight'):
                         g_id = id(module.weight)
                         if g_id not in cumulative:
-                            cumulative[g_id] = torch.zeros(module.weight.shape, dtype=torch.bool)
+                            cumulative[g_id] = torch.zeros(module.weight.shape, dtype=torch.bool, device=module.weight.device)
                         
                         for tid in mem.task_omega_snapshots:
                             num_experts = module.weight.shape[0]
