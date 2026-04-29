@@ -362,16 +362,16 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                         
                         if not is_sacred:
                             # Fresh Anchor for plastic weights
-                            model.memory.anchor[name] = p.data.clone().detach().cpu()
+                            model.memory.anchor[name] = p.data.clone().detach()
                         else:
                             # Selective update: only update plastic parts of partially sacred tensors
-                            mask = model.memory.sacred_mask[name].cpu()
+                            mask = model.memory.sacred_mask[name]
                             if name not in model.memory.anchor:
-                                model.memory.anchor[name] = p.data.clone().detach().cpu()
+                                model.memory.anchor[name] = p.data.clone().detach()
                             else:
                                 old_anc = model.memory.anchor[name]
                                 # Keep old anchor where mask is True, take new data where mask is False
-                                model.memory.anchor[name] = torch.where(mask, old_anc, p.data.cpu())
+                                model.memory.anchor[name] = torch.where(mask, old_anc, p.data)
 
                     # 2. Anchor Buffers (BN running stats)
                     for name, b in m_tracked.named_buffers():
@@ -385,7 +385,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                                 is_sacred_bn = True
                             
                             if not is_sacred_bn or name not in model.memory.anchor:
-                                model.memory.anchor[name] = b.data.clone().detach().cpu()
+                                model.memory.anchor[name] = b.data.clone().detach()
 
             # [V19] Per-task quota mask rebuild (Eternal Mind)
             model.memory._v19_update(model.memory, t_idx, _backbone_ref)
@@ -401,7 +401,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             # Prevents stale slow weights from overwriting sacred coordinates.
             if hasattr(model, 'slow_weights') and model.config.use_lookahead:
                 model.slow_weights = {
-                    n: p.data.clone().detach().cpu()
+                    n: p.data.clone().detach()
                     for n, p in model.model.named_parameters()
                     if p.requires_grad
                 }
