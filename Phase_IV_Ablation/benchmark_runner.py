@@ -24,7 +24,7 @@ def setup_compute(device_str):
         return torch.device("cuda")
     return torch.device("cpu")
 
-def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS", entity=None, suffix="", seed=42, epochs=10, tasks=10):
+def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS", entity=None, suffix="", seed=42):
     set_seed(seed)
     device = setup_compute(device_str)
     full_method_name = f"{method_name}{suffix}_seed{seed}"
@@ -328,7 +328,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
 
     _backbone_ref = model.memory.models[0] if is_antara else None
 
-    for t_idx in range(tasks):
+    for t_idx in range(10):
         train_loader, val_loader, _ = curriculum.get_task(t_idx)
 
         avg_step_time = train_single_task(
@@ -336,7 +336,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             device=device, ewc_module=ewc_module,
             agem_module=agem_module, replay_buffer=replay_buffer,
             der_module=der_module, hat_module=hat_module,
-            epochs=epochs
+            epochs=10
         )
         task_step_times.append(avg_step_time)
 
@@ -440,8 +440,6 @@ if __name__ == "__main__":
     parser.add_argument("--project", type=str, default="NeurIPS")
     parser.add_argument("--entity", type=str, default="ultron09-airbornehrs")
     parser.add_argument("--suffix", type=str, default="")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--tasks", type=int, default=10)
     args = parser.parse_args()
 
-    run_experiment(args.method, args.device, args.wandb, args.project, args.entity, args.suffix, args.seed, epochs=args.epochs, tasks=args.tasks)
+    run_experiment(args.method, args.device, args.wandb, args.project, args.entity, args.suffix, args.seed)
