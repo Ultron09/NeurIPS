@@ -23,8 +23,8 @@ jobs:
     - name: 📦 Install Latest Antara & Deps
       run: |
         python -m pip install --upgrade pip
-        # Force install latest from the core Mirror_mind repo
-        pip install git+https://github.com/Ultron09/Mirror_mind.git
+        # Install the latest official release from PyPI
+        pip install airborne-antara --upgrade
         
         # Install local research requirements
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
