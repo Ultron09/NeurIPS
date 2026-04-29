@@ -46,7 +46,17 @@ jobs:
       run: |
         # Attempt plot generation
         if [ -d results ]; then
-          python Phase_III_Metrics/generate_plots.py --input results/ANTARA_FULL_CI_RUN.json || echo "Plotting skipped"
+          python Phase_III_Metrics/generate_plots.py --input results/ANTARA_FULL_CI_RUN_metrics.json || echo "Plotting skipped"
+        fi
+
+    - name: 🤖 Antara Sentinel Audit
+      if: always()
+      run: |
+        # Run the Sentinel Agent to judge the performance
+        if [ -f results/ANTARA_FULL_CI_RUN_metrics.json ]; then
+          python Phase_IV_Ablation/sentinel_agent.py --results results/ANTARA_FULL_CI_RUN_metrics.json --target 60.0
+          # Post report to GitHub Summary
+          cat sentinel_report.md >> $GITHUB_STEP_SUMMARY
         fi
 
     - name: 📤 Upload Results
