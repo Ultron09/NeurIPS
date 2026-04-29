@@ -196,7 +196,6 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                     curr_pos += p_n
 
             # --- HARD GUARANTEES ---
-            # --- HARD GUARANTEES ---
             # 1. FC Head: Lock the output rows corresponding to all completed tasks
             fc = getattr(backbone_ref, 'fc', None)
             if fc is not None:

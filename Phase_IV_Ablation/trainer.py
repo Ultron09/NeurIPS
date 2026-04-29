@@ -204,8 +204,13 @@ def validate(model, loader, seen_classes, device, is_antara=False, hat_module=No
                 else:
                     logits = model(x)
 
-            # Safe slicing: only score over classes seen so far
+            # [V26.2] Safe slicing: only score over classes seen so far
+            # For Antara, logits are already sliced to 10 if task_id was passed
+            loss_y = y
+            if is_antara and logits.shape[1] == 10:
+                loss_y = y % 10
+            
             effective_classes = min(seen_classes, logits.shape[1])
-            total_loss += F.cross_entropy(logits[:, :effective_classes], y).item()
+            total_loss += F.cross_entropy(logits[:, :effective_classes], loss_y).item()
 
     return total_loss / len(loader)
