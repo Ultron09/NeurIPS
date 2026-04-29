@@ -75,6 +75,48 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             use_lookahead=True
         )
         model = AdaptiveFramework(model, config=config, device=device)
+    elif method_name == "ANTARA_RGW_ONLY":
+        config = AdaptiveFrameworkConfig(
+            model_dim=256,
+            num_experts=10,
+            top_k_experts=1,
+            use_moe=True,
+            use_hierarchical_moe=True,
+            use_ogd=False,
+            input_dim=3072,
+            learning_rate=1e-3,
+            ewc_lambda=150.0,
+            si_lambda=1.0,
+            use_reptile=True,
+            reptile_learning_rate=0.1,
+            use_learned_optimizer=False,
+            novelty_z_threshold=1.2,
+            adaptation_threshold=0.05,
+            use_gradient_centralization=True,
+            use_lookahead=True
+        )
+        model = AdaptiveFramework(model, config=config, device=device)
+    elif method_name == "ANTARA_OGD_ONLY":
+        config = AdaptiveFrameworkConfig(
+            model_dim=256,
+            num_experts=10,
+            top_k_experts=1,
+            use_moe=True,
+            use_hierarchical_moe=True,
+            use_ogd=True,
+            ogd_max_basis_size=256,
+            input_dim=3072,
+            learning_rate=1e-3,
+            ewc_lambda=150.0,
+            si_lambda=1.0,
+            use_reptile=False,
+            use_learned_optimizer=False,
+            novelty_z_threshold=1.2,
+            adaptation_threshold=0.05,
+            use_gradient_centralization=True,
+            use_lookahead=True
+        )
+        model = AdaptiveFramework(model, config=config, device=device)
     elif method_name == "EWC":
         ewc_module = EWC(model, lambda_factor=5000)
     elif method_name == "REPLAY":
