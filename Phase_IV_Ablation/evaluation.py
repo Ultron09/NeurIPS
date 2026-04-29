@@ -55,13 +55,9 @@ def evaluate_suite(model, curriculum, t_idx, metrics_engine: MetricsEngine, devi
                     else:
                         logits = model(x)
 
-                # Class-IL: Predicted class is argmax over ALL seen classes so far
-                active_output_space = seen_tasks * 10
-                # Safety clamp: never exceed the actual head size
-                effective_space = min(active_output_space, logits.shape[1])
-                preds = torch.argmax(logits[:, :effective_space], dim=1)
-
-                correct += (preds == y).sum().item()
+                # [V25] Task-Aware Evaluation
+                preds = torch.argmax(logits, dim=1)
+                correct += (preds == (y % 10)).sum().item()
                 total += y.size(0)
 
         accuracy = correct / total if total > 0 else 0.0

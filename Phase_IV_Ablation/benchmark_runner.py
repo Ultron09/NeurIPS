@@ -129,17 +129,16 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         model.memory._update_sacred_core = lambda *a, **k: None
 
         # -----------------------------------------------------------------
-        # [V18] IRON SOUL: 8% QUOTA + NOISE FLOOR
+        # [V19] ETERNAL MIND: GUARANTEED 8% QUOTA
         # -----------------------------------------------------------------
-        def _v18_update(mem, task_id, backbone_ref):
+        def _v19_update(mem, task_id, backbone_ref):
             """
             1. Snapshot current task's importance.
             2. Rebuild cumulative mask as UNION of per-task top-8% masks.
-            3. Apply 1e-5 Noise Floor to prevent locking artifacts.
+            3. No hard noise floor: top-8% is absolute.
             4. Hard-lock FC head and Gating logic.
             """
             PER_TASK_QUOTA = 0.08 # Exactly 8% as requested
-            MIN_IMPORTANCE = 1e-5 # Noise Floor
 
             id_to_p   = {} 
             id_to_imp = {}
@@ -151,13 +150,20 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                             continue
                         p_id = id(p)
                         id_to_p[p_id] = (name, p)
+                        # [V19] Get importance and ensure it is non-negative
                         curr = mem.omega.get(name, torch.zeros_like(p).cpu()).clone()
                         if name in mem.fisher_dict:
                             curr = curr + mem.fisher_dict[name].cpu()
-                        id_to_imp[p_id] = curr
+                        id_to_imp[p_id] = curr.abs()
 
             if not id_to_imp:
                 return
+
+            # [V22.2] Neural Tie-Breaking: Add tiny random noise to importance
+            # This ensures that if importance is 0 everywhere, we still pick a 
+            # stable set of weights to fill the 8% quota rather than locking nothing.
+            for pid in id_to_imp:
+                id_to_imp[pid] = id_to_imp[pid] + torch.randn_like(id_to_imp[pid]) * 1e-12
 
             mem.task_omega_snapshots[task_id] = {
                 pid: imp.clone() for pid, imp in id_to_imp.items()
@@ -165,17 +171,29 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
 
             cumulative = {}
             for tid, snap in mem.task_omega_snapshots.items():
-                flat = torch.cat([v.view(-1) for v in snap.values()])
-                n = flat.numel()
-                # Find threshold for TOP 8%
-                k = max(1, min(int((1.0 - PER_TASK_QUOTA) * n), n - 1))
-                kth_val = torch.kthvalue(flat, k).values.item()
-                # Threshold must be at least MIN_IMPORTANCE
-                thr = max(kth_val, MIN_IMPORTANCE)
-                
+                # [V22] Sanitize and Combine Importance
+                all_tensors = []
                 for pid, imp in snap.items():
-                    m = (imp >= thr).bool()
+                    # Handle NaNs and Infs locally
+                    imp = torch.nan_to_num(imp, nan=0.0, posinf=0.0, neginf=0.0)
+                    all_tensors.append(imp.view(-1))
+                
+                flat = torch.cat(all_tensors)
+                n = flat.numel()
+                k = max(1, min(int(PER_TASK_QUOTA * n), n))
+                
+                # [V22.5] Index-based masking ensures EXACT 8.00% saturation
+                _, top_idx = torch.topk(flat, k)
+                task_mask_flat = torch.zeros_like(flat, dtype=torch.bool)
+                task_mask_flat[top_idx] = True
+                
+                # Unflatten the task mask back to parameters
+                curr_pos = 0
+                for pid, imp in snap.items():
+                    p_n = imp.numel()
+                    m = task_mask_flat[curr_pos : curr_pos + p_n].view_as(imp)
                     cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
+                    curr_pos += p_n
 
             # --- HARD GUARANTEES ---
             # --- HARD GUARANTEES ---
@@ -243,7 +261,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             mem.saturation_level = protected / total_n if total_n > 0 else 0.0
             print(f"  [SENTIENT] Sacred Mask Updated. Global Saturation: {mem.saturation_level:.2%}")
 
-        model.memory._v18_update = _v18_update
+        model.memory._v19_update = _v19_update
 
 
         # -----------------------------------------------------------------
@@ -331,15 +349,47 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             print(f"\n[ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
             model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
 
-            # [V15 Fix C] Re-sync SI anchor to current params AFTER consolidation.
+            # [V23] IMMUTABLE ANCHORING: Never overwrite anchors for already-sacred weights.
+            # This fixes 'Sliding Window Amnesia' where Task 0 drift is legalized at every task end.
             with torch.no_grad():
                 for m_tracked in model.memory.models:
+                    # 1. Anchor Parameters (Weights/Bias)
                     for name, p in m_tracked.named_parameters():
-                        if p.requires_grad:
+                        if not p.requires_grad: continue
+                        
+                        is_sacred = False
+                        if name in model.memory.sacred_mask and model.memory.sacred_mask[name].any():
+                            is_sacred = True
+                        
+                        if not is_sacred:
+                            # Fresh Anchor for plastic weights
                             model.memory.anchor[name] = p.data.clone().detach().cpu()
+                        else:
+                            # Selective update: only update plastic parts of partially sacred tensors
+                            mask = model.memory.sacred_mask[name].cpu()
+                            if name not in model.memory.anchor:
+                                model.memory.anchor[name] = p.data.clone().detach().cpu()
+                            else:
+                                old_anc = model.memory.anchor[name]
+                                # Keep old anchor where mask is True, take new data where mask is False
+                                model.memory.anchor[name] = torch.where(mask, old_anc, p.data.cpu())
 
-            # [V18] Per-task quota mask rebuild (Iron Soul)
-            model.memory._v18_update(model.memory, t_idx, _backbone_ref)
+                    # 2. Anchor Buffers (BN running stats)
+                    for name, b in m_tracked.named_buffers():
+                        if 'running_mean' in name or 'running_var' in name:
+                            # BN stats follow the same immutable rule
+                            is_sacred_bn = False
+                            # Check if the parent module's weight is sacred
+                            prefix = name.rsplit('.', 1)[0]
+                            w_name = f"{prefix}.weight"
+                            if w_name in model.memory.sacred_mask and model.memory.sacred_mask[w_name].any():
+                                is_sacred_bn = True
+                            
+                            if not is_sacred_bn or name not in model.memory.anchor:
+                                model.memory.anchor[name] = b.data.clone().detach().cpu()
+
+            # [V19] Per-task quota mask rebuild (Eternal Mind)
+            model.memory._v19_update(model.memory, t_idx, _backbone_ref)
 
             total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
             num_total    = sum(p.numel() for p in _backbone_ref.parameters() if p.requires_grad)
