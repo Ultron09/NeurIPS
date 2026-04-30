@@ -192,10 +192,10 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
                             continue
                         p_id = id(p)
                         id_to_p[p_id] = (name, p)
-                        # [V19] Get importance and ensure it is non-negative
+                        # [V19] Get importance and ensure it is on the correct device
                         curr = mem.omega.get(name, torch.zeros_like(p)).clone()
                         if name in mem.fisher_dict:
-                            curr = curr + mem.fisher_dict[name]
+                            curr = curr + mem.fisher_dict[name].to(curr.device)
                         id_to_imp[p_id] = curr.abs()
 
             if not id_to_imp:
