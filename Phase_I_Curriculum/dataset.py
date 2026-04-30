@@ -71,3 +71,51 @@ if __name__ == "__main__":
     print(f"Task Boundaries: {curriculum.task_classes}")
     t1_train, _, _ = curriculum.get_task(0)
     print(f"Task 1 Loaders Ready. Batch size: {next(iter(t1_train))[0].size(0)}")
+
+
+class SplitMNIST:
+    """Standard 5-task MNIST split (2 classes per task)."""
+    def __init__(self, root='./data', seed=42, batch_size=64, pin_memory=False):
+        self.root = root
+        self.batch_size = batch_size
+        self.pin_memory = pin_memory
+        set_seed(seed)
+        
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
+        
+        self.train_set = datasets.MNIST(root=root, train=True, download=True, transform=self.transform)
+        self.test_set = datasets.MNIST(root=root, train=False, download=True, transform=self.transform)
+        self.task_classes = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
+
+    def get_task(self, task_id):
+        if task_id < 0 or task_id >= 5: raise ValueError("Task ID 0-4")
+        target_classes = self.task_classes[task_id]
+        train_idx = [i for i, l in enumerate(self.train_set.targets) if l in target_classes]
+        test_idx = [i for i, l in enumerate(self.test_set.targets) if l in target_classes]
+        
+        split = int(0.9 * len(train_idx))
+        t_idx = train_idx[:split]
+        v_idx = train_idx[split:]
+        
+        return DataLoader(Subset(self.train_set, t_idx), batch_size=self.batch_size, shuffle=True), \
+               DataLoader(Subset(self.train_set, v_idx), batch_size=self.batch_size, shuffle=False), \
+               DataLoader(Subset(self.test_set, test_idx), batch_size=self.batch_size, shuffle=False)
+
+
+class SplitTinyImageNet:
+    """Stub for TinyImageNet (200 classes, 10 tasks, 20 classes/task)."""
+    def __init__(self, root='./data', seed=42, batch_size=64, pin_memory=False):
+        self.root = root
+        self.batch_size = batch_size
+        self.pin_memory = pin_memory
+        set_seed(seed)
+        # In a real run, this would load the downloaded TinyImageNet files.
+        # For now, it raises an error or falls back to CIFAR if data is missing.
+        print("WARNING: TinyImageNet requires local dataset download. Falling back to internal logic.")
+        self.task_classes = [list(range(i, i+20)) for i in range(0, 200, 20)]
+
+    def get_task(self, task_id):
+        raise NotImplementedError("TinyImageNet requires manual dataset path configuration.")

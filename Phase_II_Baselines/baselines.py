@@ -203,3 +203,56 @@ class AGEM:
         if dot < 0:
             return curr_grad - (dot / (torch.dot(ref_grad, ref_grad) + 1e-9)) * ref_grad
         return curr_grad
+
+
+class iCaRL(nn.Module):
+    """
+    iCaRL: Incremental Classifier and Representation Learning (Rebuffi et al. 2017).
+    The classic Class-IL baseline using Nearest-Class-Mean (NCM) classifier.
+    """
+    def __init__(self, model, buffer_size=2000, num_classes=100):
+        super().__init__()
+        self.model = model
+        self.buffer_size = buffer_size
+        self.num_classes = num_classes
+        self.exemplars = {} # class_id -> list of samples
+        self.class_means = None
+
+    def update_exemplars(self, dataset, class_id, device='cuda'):
+        self.model.eval()
+        all_features = []
+        with torch.no_grad():
+            loader = torch.utils.data.DataLoader(dataset, batch_size=64)
+            for x, _ in loader:
+                x = x.to(device)
+                feat = self.model.extract_features(x) if hasattr(self.model, 'extract_features') else self.model(x)
+                all_features.append(feat.cpu())
+        
+        all_features = torch.cat(all_features)
+        mean_feat = all_features.mean(dim=0)
+        
+        # Herding: greedily pick samples whose mean is closest to the real mean
+        selected = []
+        current_sum = torch.zeros_like(mean_feat)
+        for i in range(min(20, len(all_features))): # simplified herding
+            dist = torch.norm(mean_feat - (current_sum + all_features) / (len(selected) + 1), dim=1)
+            idx = torch.argmin(dist).item()
+            selected.append(all_features[idx])
+            current_sum += all_features[idx]
+        
+        self.exemplars[class_id] = selected
+
+    def compute_means(self, device='cuda'):
+        self.model.eval()
+        self.class_means = {}
+        for class_id, samples in self.exemplars.items():
+            feats = torch.stack(samples).to(device)
+            self.class_means[class_id] = feats.mean(dim=0)
+
+    def classify(self, x, device='cuda'):
+        self.model.eval()
+        feat = self.model.extract_features(x) if hasattr(self.model, 'extract_features') else self.model(x)
+        dists = []
+        for class_id in sorted(self.class_means.keys()):
+            dists.append(torch.norm(feat - self.class_means[class_id], dim=1))
+        return torch.argmin(torch.stack(dists), dim=0)

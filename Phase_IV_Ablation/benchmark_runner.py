@@ -10,8 +10,8 @@ from torchvision.models import resnet18
 for d in ['Phase_I_Curriculum', 'Phase_II_Baselines', 'Phase_III_Metrics']:
     sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), d))
 
-from dataset import SplitCIFAR100, set_seed
-from baselines import EWC, ExperienceReplay, AGEM, DERPlus, HAT
+from dataset import SplitCIFAR100, SplitMNIST, set_seed
+from baselines import EWC, ExperienceReplay, AGEM, DERPlus, HAT, iCaRL
 from metrics import MetricsEngine
 from trainer import train_single_task
 from evaluation import evaluate_suite
@@ -23,7 +23,7 @@ def setup_compute(device_str):
         return torch.device("cuda")
     return torch.device("cpu")
 
-def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS", entity=None, suffix="", seed=42):
+def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS", entity=None, suffix="", seed=42, dataset_name="CIFAR100"):
     set_seed(seed)
     device = setup_compute(device_str)
     full_method_name = f"{method_name}{suffix}_seed{seed}"
@@ -42,7 +42,12 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     def model_factory():
         return resnet18(num_classes=100)
 
-    curriculum = SplitCIFAR100(pin_memory=(device.type == "cuda"))
+    if dataset_name == "CIFAR100":
+        curriculum = SplitCIFAR100(pin_memory=(device.type == "cuda"))
+        num_tasks = 10
+    else:
+        curriculum = SplitMNIST(pin_memory=(device.type == "cuda"))
+        num_tasks = 5
     model = model_factory().to(device)
 
     ewc_module = None
@@ -50,6 +55,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     agem_module = None
     der_module = None
     hat_module = None
+    icarl_module = None
     config = None
 
     if method_name == "ANTARA_FULL":
@@ -61,7 +67,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             use_hierarchical_moe=True,
             use_ogd=True,
             ogd_max_basis_size=1024,
-            iron_mind_quota=0.15,
+            iron_mind_quota=0.30,
             moe_temperature=1.0,
             moe_temp_decay=0.85,
             input_dim=3072,
@@ -129,7 +135,9 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     elif method_name == "DER++":
         der_module = DERPlus(model, buffer_size=2000, alpha=0.1)
     elif method_name == "HAT":
-        hat_module = HAT(model, num_tasks=10).to(device)
+        hat_module = HAT(model, num_tasks=num_tasks).to(device)
+    elif method_name == "iCaRL":
+        icarl_module = iCaRL(model, buffer_size=2000, num_classes=100).to(device)
     elif method_name == "NAIVE":
         pass
     else:
@@ -144,11 +152,11 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     # MAIN TRAINING LOOP
     # =========================================================================
     optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-    metrics   = MetricsEngine(num_tasks=10, config_name=full_method_name)
+    metrics   = MetricsEngine(num_tasks=num_tasks, config_name=full_method_name)
     total_start_time  = time.time()
     task_step_times   = []
 
-    for t_idx in range(10):
+    for t_idx in range(num_tasks):
         train_loader, val_loader, _ = curriculum.get_task(t_idx)
 
         avg_step_time = train_single_task(
@@ -164,6 +172,10 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             ewc_module.save_task_weights(train_loader, device=device)
         elif method_name == "HAT":
             hat_module.update_cumulative_mask(t_idx)
+        elif method_name == "iCaRL":
+            for c in curriculum.task_classes[t_idx]:
+                icarl_module.update_exemplars(train_loader.dataset, c, device=device)
+            icarl_module.compute_means(device=device)
 
         if is_antara:
             model.on_task_complete(t_idx)
@@ -194,7 +206,8 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", type=str, required=True,
-                        choices=["ANTARA_FULL", "ANTARA_RGW_ONLY", "ANTARA_OGD_ONLY", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE"])
+                        choices=["ANTARA_FULL", "ANTARA_RGW_ONLY", "ANTARA_OGD_ONLY", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE", "iCaRL"])
+    parser.add_argument("--dataset", type=str, default="CIFAR100", choices=["CIFAR100", "MNIST"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb", action="store_true")
@@ -203,4 +216,4 @@ if __name__ == "__main__":
     parser.add_argument("--suffix", type=str, default="")
     args = parser.parse_args()
 
-    run_experiment(args.method, args.device, args.wandb, args.project, args.entity, args.suffix, args.seed)
+    run_experiment(args.method, args.device, args.wandb, args.project, args.entity, args.suffix, args.seed, args.dataset)
