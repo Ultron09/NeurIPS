@@ -186,7 +186,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     # FINALIZE
     # =========================================================================
     total_duration = time.time() - total_start_time
-    metrics.avg_step_time_ms        = (sum(task_step_times) / len(task_step_times)) * 1000
+    metrics.avg_step_time_ms        = (sum(task_step_times) / len(task_step_times))
     metrics.total_compute_time_sec  = total_duration
     if device.type == "cuda":
         metrics.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
