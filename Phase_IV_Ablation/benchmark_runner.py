@@ -56,11 +56,58 @@ def git_sync_file(filepath, message="Result Sync"):
     except Exception as e:
         print(f"[GIT_WARN] Sync failed for {filepath}: {e}")
 
+class ContinualTrainer:
+    def __init__(self, model, device='cuda'):
+        self.model = model; self.device = device
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=getattr(model.config, 'learning_rate', 2e-3))
+    def train_task(self, loader, t_idx, epochs=3):
+        return train_single_task(self.model, loader, loader, self.optimizer, t_idx, device=self.device, epochs=epochs)
+
+class ContinualEvaluator:
+    def __init__(self, model, device='cuda'):
+        self.model = model; self.device = device
+    def evaluate(self, loader, t_idx):
+        self.model.eval()
+        correct = 0; total = 0
+        with torch.no_grad():
+            for x, y in loader:
+                x, y = x.to(self.device), y.to(self.device)
+                logits = self.model.inference_step(x) if hasattr(self.model, 'inference_step') else self.model(x)
+                if isinstance(logits, tuple): logits = logits[0]
+                preds = torch.argmax(logits, dim=1)
+                correct += (preds == y).sum().item(); total += y.size(0)
+        return correct / total if total > 0 else 0.0
+
+def model_factory(dataset_name, num_classes=100):
+    from torchvision.models import resnet18
+    model = resnet18(num_classes=num_classes)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.maxpool = nn.Identity()
+    return model
+
+def get_stage_config(stage_id: int, dataset_name: str):
+    base_params = {
+        "model_dim": 256, "num_experts": 10, "experts_per_domain": 4, "top_k_experts": 2,
+        "input_dim": 12288 if dataset_name == "TinyImageNet" else 3072,
+        "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
+        "learning_rate": 2e-3, "use_gradient_centralization": True, "use_lookahead": True,
+    }
+    if stage_id == -1: return AdaptiveFrameworkConfig(**base_params, memory_type='ewc', ewc_lambda=5000, use_moe=False)
+    if stage_id == -2: return AdaptiveFrameworkConfig(**base_params, memory_type='hybrid', use_prioritized_replay=True, dream_batch_size=32)
+    if stage_id == -4: return AdaptiveFrameworkConfig(**base_params, memory_type='orthogonal', use_moe=False)
+    if stage_id == 1: return AdaptiveFrameworkConfig(**base_params, use_moe=False, si_lambda=0.0)
+    if stage_id == 2: return AdaptiveFrameworkConfig(**base_params, use_moe=False, si_lambda=1.5)
+    if stage_id == 3: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5)
+    if stage_id == 4: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True)
+    if stage_id == 5: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True)
+    if stage_id == 6: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True)
+    if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, iron_mind_quota=0.25)
+    return AdaptiveFrameworkConfig(**base_params)
+
 def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     node_name = get_node_name()
     method_name = { -1: "EWC", -2: "DER++", -3: "LwF", -4: "RanPAC" }.get(stage_id, f"ANTARA_S{stage_id}")
     
-    # [V28] IDEMPOTENCY CHECK
     res_dir = os.path.join(os.getcwd(), "results")
     os.makedirs(res_dir, exist_ok=True)
     filename = f"SeqN_{node_name}_{seed}_{dataset_name}_{stage_id}.txt"
@@ -72,7 +119,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
 
     print(f"\n{'='*60}\nLAUNCHING: {method_name} | {dataset_name} | Seed: {seed}\n{'='*60}")
     
-    # SEEDING
     import random
     import numpy as np
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -86,7 +132,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     if dataset_name == "CIFAR100": curriculum = SplitCIFAR100(root=data_path); num_classes = 100; num_tasks = 10
     else: curriculum = SplitTinyImageNet(root=data_path); num_classes = 200; num_tasks = 10
     
-    from benchmark_runner import get_stage_config, model_factory, ContinualTrainer, ContinualEvaluator
     config = get_stage_config(stage_id, dataset_name)
     model = AdaptiveFramework(model_factory(dataset_name, num_classes=num_classes), config=config).to(device)
     trainer = ContinualTrainer(model, device=device); evaluator = ContinualEvaluator(model, device=device)
@@ -139,4 +184,3 @@ if __name__ == "__main__":
                     print(f"\n[CRITICAL_FAIL] {ds} S{stage} Seed {seed} failed. Moving to next run.")
                     print(traceback.format_exc())
                     continue
-    print("\n[FINISH] All requested stages processed.")
