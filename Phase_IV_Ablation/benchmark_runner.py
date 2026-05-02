@@ -9,6 +9,7 @@ import traceback
 import random
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 from torchvision.models.resnet import ResNet, BasicBlock
+from torchvision import transforms
 from trainer import train_single_task
 
 # [V29] RESOURCE TELEMETRY UTILS
@@ -72,15 +73,21 @@ def model_factory(dataset_name, num_classes=100):
 
 
 class ExternalReplayBuffer:
-    """[V29] Direct (x, y) tensor buffer for Class-IL replay.
-    Stores raw samples on CPU. ~6MB per task for CIFAR-100."""
-    def __init__(self, per_task=500):
+    """[V30] Direct (x, y) tensor buffer for Class-IL replay.
+    Stores CLEAN (un-augmented) samples on CPU to avoid baking in
+    one specific random crop. Augmentation applied on-the-fly during sample()."""
+    def __init__(self, per_task=1000):
         self.per_task = per_task
         self.x_data = []  # list of tensors, one per stored sample
         self.y_data = []
+        self._aug = transforms.Compose([
+            transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
+            transforms.RandomHorizontalFlip(),
+        ])
 
     def update_from_loader(self, loader):
-        """Store random subset of a task's data after training completes."""
+        """Store random subset of a task's data after training completes.
+        Uses the loader to extract data but stores the raw tensors."""
         all_x, all_y = [], []
         for x, y in loader:
             all_x.append(x.cpu())
@@ -95,11 +102,14 @@ class ExternalReplayBuffer:
         return sum(x.size(0) for x in self.x_data)
 
     def sample(self, batch_size):
-        """Random sample across all stored tasks."""
+        """Random sample across all stored tasks with on-the-fly augmentation."""
         all_x = torch.cat(self.x_data)
         all_y = torch.cat(self.y_data)
         indices = torch.randperm(len(all_x))[:batch_size]
-        return all_x[indices], all_y[indices]
+        batch_x = all_x[indices]
+        # Apply augmentation on-the-fly for diversity
+        batch_x = self._aug(batch_x)
+        return batch_x, all_y[indices]
 
 
 class ContinualTrainer:
@@ -140,7 +150,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
     if stage_id == 4: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, enable_dreaming=True, dream_interval=5)
     if stage_id == 5: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_dreaming=True, dream_interval=5)
     if stage_id == 6: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, enable_dreaming=True, dream_interval=5)
-    if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, iron_mind_quota=0.25, enable_dreaming=True, dream_interval=5)
+    if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=0.8, enable_consciousness=True, use_reptile=True, enable_world_model=True, iron_mind_quota=0.15, enable_dreaming=True, dream_interval=5)
     return AdaptiveFrameworkConfig(**base_params)
 
 def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
@@ -181,12 +191,12 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
 
     initial_accuracies = []
     final_accuracies = []
-    replay_buf = ExternalReplayBuffer(per_task=500)
+    replay_buf = ExternalReplayBuffer(per_task=1000)
 
     for t_idx in range(num_tasks):
         train_loader, _, _ = curriculum.get_task(t_idx)
         test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
-        trainer.train_task(train_loader, t_idx, epochs=10, replay_buffer=replay_buf if t_idx > 0 else None)
+        trainer.train_task(train_loader, t_idx, epochs=15, replay_buffer=replay_buf if t_idx > 0 else None)
         
         # Store exemplars for future replay BEFORE consolidation
         replay_buf.update_from_loader(train_loader)

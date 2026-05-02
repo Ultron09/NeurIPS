@@ -41,7 +41,9 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                 # Two separate steps cause gradient tug-of-war and halve Task N learning.
                 # One mixed batch lets the optimizer see a combined gradient.
                 if replay_buffer and len(replay_buffer) > 0:
-                    n_replay = min(max(t_idx * 8, 8), 48)  # Scale: 8→16→24→...→48
+                    # [V30] BALANCED REPLAY: 50% old + 50% new = equal class gradient.
+                    # V29's t_idx*8 produced only 8 samples (11% ratio) → catastrophic erasure.
+                    n_replay = min(x.size(0), len(replay_buffer))  # Match batch = 50/50
                     rx, ry = replay_buffer.sample(n_replay)
                     rx, ry = rx.to(device).float(), ry.to(device)
                     mixed_x = torch.cat([x.float(), rx])
