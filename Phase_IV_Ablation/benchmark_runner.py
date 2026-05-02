@@ -6,8 +6,10 @@ import socket
 import subprocess
 import time
 import traceback
+import random
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 from torchvision.models.resnet import ResNet, BasicBlock
+from trainer import train_single_task
 
 # [V29] RESOURCE TELEMETRY UTILS
 try:
@@ -68,12 +70,44 @@ class ContinualResNet(ResNet):
 def model_factory(dataset_name, num_classes=100):
     return ContinualResNet(num_classes=num_classes)
 
+
+class ExternalReplayBuffer:
+    """[V29] Direct (x, y) tensor buffer for Class-IL replay.
+    Stores raw samples on CPU. ~6MB per task for CIFAR-100."""
+    def __init__(self, per_task=500):
+        self.per_task = per_task
+        self.x_data = []  # list of tensors, one per stored sample
+        self.y_data = []
+
+    def update_from_loader(self, loader):
+        """Store random subset of a task's data after training completes."""
+        all_x, all_y = [], []
+        for x, y in loader:
+            all_x.append(x.cpu())
+            all_y.append(y.cpu())
+        all_x = torch.cat(all_x)
+        all_y = torch.cat(all_y)
+        indices = torch.randperm(len(all_x))[:self.per_task]
+        self.x_data.append(all_x[indices])
+        self.y_data.append(all_y[indices])
+
+    def __len__(self):
+        return sum(x.size(0) for x in self.x_data)
+
+    def sample(self, batch_size):
+        """Random sample across all stored tasks."""
+        all_x = torch.cat(self.x_data)
+        all_y = torch.cat(self.y_data)
+        indices = torch.randperm(len(all_x))[:batch_size]
+        return all_x[indices], all_y[indices]
+
+
 class ContinualTrainer:
     def __init__(self, model, device='cuda'):
         self.model = model; self.device = device
         self.optimizer = torch.optim.Adam(model.parameters(), lr=getattr(model.config, 'learning_rate', 5e-4))
-    def train_task(self, loader, t_idx, epochs=10):
-        return train_single_task(self.model, loader, loader, self.optimizer, t_idx, device=self.device, epochs=epochs)
+    def train_task(self, loader, t_idx, epochs=10, replay_buffer=None):
+        return train_single_task(self.model, loader, loader, self.optimizer, t_idx, device=self.device, epochs=epochs, replay_buffer=replay_buffer)
 
 class ContinualEvaluator:
     def __init__(self, model, device='cuda'):
@@ -147,11 +181,16 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
 
     initial_accuracies = []
     final_accuracies = []
+    replay_buf = ExternalReplayBuffer(per_task=500)
 
     for t_idx in range(num_tasks):
         train_loader, _, _ = curriculum.get_task(t_idx)
         test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
-        trainer.train_task(train_loader, t_idx, epochs=10)
+        trainer.train_task(train_loader, t_idx, epochs=10, replay_buffer=replay_buf if t_idx > 0 else None)
+        
+        # Store exemplars for future replay BEFORE consolidation
+        replay_buf.update_from_loader(train_loader)
+        print(f"             [REPLAY] Buffer: {len(replay_buf)} exemplars from {t_idx + 1} tasks.")
         
         # [V29] CRITICAL: Signal end-of-task to framework.
         # This finalizes SI importance, builds Iron Mind sacred mask,

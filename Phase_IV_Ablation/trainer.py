@@ -51,6 +51,18 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                                           record_stats=True)
                 step_loss = result.get('total_loss', result.get('loss', 0.0))
 
+                # [V29] EXTERNAL REPLAY: Inject old task data directly.
+                # The framework's internal dreaming stores metadata, not raw tensors.
+                # This bypasses it with a direct (x, y) replay step.
+                if replay_buffer and len(replay_buffer) > 0:
+                    rx, ry = replay_buffer.sample(min(32, len(replay_buffer)))
+                    rx, ry = rx.to(device).float(), ry.to(device)
+                    model.train_step(rx, target_data=ry,
+                                     task_id=t_idx,
+                                     enable_dream=False,
+                                     meta_step=False,
+                                     record_stats=False)
+
 
             else:
                 # ============================================================
