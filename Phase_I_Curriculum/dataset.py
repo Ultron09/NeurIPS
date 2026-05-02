@@ -86,8 +86,10 @@ class SplitMNIST:
         set_seed(seed)
         
         self.transform = transforms.Compose([
+            transforms.Resize((32, 32)),
             transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
+            transforms.Lambda(lambda x: x.repeat(3, 1, 1)), # Convert 1-ch to 3-ch
+            transforms.Normalize((0.1307, 0.1307, 0.1307), (0.3081, 0.3081, 0.3081))
         ])
         
         self.train_set = datasets.MNIST(root=root, train=True, download=True, transform=self.transform)
@@ -121,8 +123,9 @@ class SplitTinyImageNet:
         self.pin_memory = pin_memory
         set_seed(seed)
         
-        # TinyImageNet (64x64) Normalization
+        # TinyImageNet (64x64) -> Resize to 32x32 for architectural consistency
         self.transform = transforms.Compose([
+            transforms.Resize((32, 32)),
             transforms.ToTensor(),
             transforms.Normalize((0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262))
         ])
