@@ -7,8 +7,9 @@ import subprocess
 import time
 import traceback
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
+from torchvision.models.resnet import ResNet, BasicBlock
 
-# [V28] RESOURCE TELEMETRY UTILS
+# [V29] RESOURCE TELEMETRY UTILS
 try:
     import psutil
 except ImportError:
@@ -34,7 +35,7 @@ def get_resource_usage():
         metrics["ram_usage_gb"] = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
     return metrics
 
-# [V28] PATH INJECTION
+# [V29] PATH INJECTION
 root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if root_path not in sys.path:
     sys.path.append(root_path)
@@ -56,11 +57,22 @@ def git_sync_file(filepath, message="Result Sync"):
     except Exception as e:
         print(f"[GIT_WARN] Sync failed for {filepath}: {e}")
 
+class ContinualResNet(ResNet):
+    def __init__(self, num_classes=100):
+        super(ContinualResNet, self).__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.maxpool = nn.Identity()
+    def forward(self, x, task_id=None, **kwargs):
+        return super().forward(x)
+
+def model_factory(dataset_name, num_classes=100):
+    return ContinualResNet(num_classes=num_classes)
+
 class ContinualTrainer:
     def __init__(self, model, device='cuda'):
         self.model = model; self.device = device
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=getattr(model.config, 'learning_rate', 2e-3))
-    def train_task(self, loader, t_idx, epochs=3):
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=getattr(model.config, 'learning_rate', 5e-4))
+    def train_task(self, loader, t_idx, epochs=10):
         return train_single_task(self.model, loader, loader, self.optimizer, t_idx, device=self.device, epochs=epochs)
 
 class ContinualEvaluator:
@@ -77,26 +89,6 @@ class ContinualEvaluator:
                 preds = torch.argmax(logits, dim=1)
                 correct += (preds == y).sum().item(); total += y.size(0)
         return correct / total if total > 0 else 0.0
-
-class TaskAwareModel(nn.Module):
-    def __init__(self, base_model):
-        super().__init__()
-        self.base_model = base_model
-        self.config = getattr(base_model, 'config', None)
-    def forward(self, x, task_id=None, **kwargs):
-        return self.base_model(x)
-    def __getattr__(self, name):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.base_model, name)
-
-def model_factory(dataset_name, num_classes=100):
-    from torchvision.models import resnet18
-    model = resnet18(num_classes=num_classes)
-    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    model.maxpool = nn.Identity()
-    return TaskAwareModel(model)
 
 def get_stage_config(stage_id: int, dataset_name: str):
     base_params = {
@@ -167,8 +159,11 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         
         avg_acc = sum(task_accuracies) / len(task_accuracies)
         acc_str = ", ".join([f"T{i}: {acc:.2%}" for i, acc in enumerate(task_accuracies)])
+        
+        usage = get_resource_usage()
         print(f"\n[LIVE_DEBUG] Task {t_idx} Finished | Average Accuracy: {avg_acc:.2%}")
         print(f"             Accuracies: [{acc_str}]")
+        print(f"             Resource: VRAM {usage['vram_peak_gb']:.2f}GB | Power {usage['avg_power_w']:.1f}W")
         results.append(avg_acc)
         
         if t_idx == num_tasks - 1:
