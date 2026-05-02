@@ -78,12 +78,25 @@ class ContinualEvaluator:
                 correct += (preds == y).sum().item(); total += y.size(0)
         return correct / total if total > 0 else 0.0
 
+class TaskAwareModel(nn.Module):
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+        self.config = getattr(base_model, 'config', None)
+    def forward(self, x, task_id=None, **kwargs):
+        return self.base_model(x)
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_model, name)
+
 def model_factory(dataset_name, num_classes=100):
     from torchvision.models import resnet18
     model = resnet18(num_classes=num_classes)
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     model.maxpool = nn.Identity()
-    return model
+    return TaskAwareModel(model)
 
 def get_stage_config(stage_id: int, dataset_name: str):
     base_params = {
@@ -143,7 +156,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     for t_idx in range(num_tasks):
         train_loader, _, _ = curriculum.get_task(t_idx)
         test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
-        trainer.train_task(train_loader, t_idx, epochs=3)
+        trainer.train_task(train_loader, t_idx, epochs=10)
         task_accuracies = [evaluator.evaluate(loader, i) for i, loader in enumerate(test_loaders)]
         avg_acc = sum(task_accuracies) / len(task_accuracies)
         print(f"Task {t_idx} AA: {avg_acc:.2%}"); results.append(avg_acc)
