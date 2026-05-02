@@ -152,8 +152,10 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
             best_loss = val_loss
             best_model = copy.deepcopy(model.state_dict())
             
-    # Always restore best model weights before consolidation
-    model.load_state_dict(best_model)
+    # [V29 FIX] DO NOT restore best_model checkpoint.
+    # Restoring overwrites Iron Mind sacred masks, SI importance paths,
+    # and all memory consolidation state that the framework accumulated
+    # during training. The framework's final state IS the correct state.
 
     avg_step_time = total_step_time / total_steps if total_steps > 0 else 0
     return avg_step_time
