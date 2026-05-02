@@ -103,7 +103,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
         "model_dim": 256, "num_experts": 10, "experts_per_domain": 4, "top_k_experts": 2,
         "input_dim": 12288 if dataset_name == "TinyImageNet" else 3072,
         "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
-        "learning_rate": 2e-3, "use_gradient_centralization": True, "use_lookahead": True,
+        "learning_rate": 5e-4, "use_gradient_centralization": True, "use_lookahead": True,
     }
     if stage_id == -1: return AdaptiveFrameworkConfig(**base_params, memory_type='ewc', ewc_lambda=5000, use_moe=False)
     if stage_id == -2: return AdaptiveFrameworkConfig(**base_params, memory_type='hybrid', use_prioritized_replay=True, dream_batch_size=32)
