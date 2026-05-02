@@ -43,17 +43,13 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                 # ============================================================
                 # ANTARA COGNITIVE PATH
                 # ============================================================
-                try:
-                    result = model.train_step(x, target_data=y,
-                                              task_id=t_idx, 
-                                              enable_dream=True,
-                                              meta_step=True,
-                                              record_stats=True)
-                    step_loss = result.get('total_loss', result.get('loss', 0.0))
-                except Exception as e:
-
-                    print(f"  [ANTARA] train_step error at T{t_idx} E{epoch}: {e}")
-                    step_loss = float('inf')
+                # Removed try-except to prevent silent failures. If this fails, we need to know.
+                result = model.train_step(x.float(), target_data=y,
+                                          task_id=t_idx, 
+                                          enable_dream=True,
+                                          meta_step=True,
+                                          record_stats=True)
+                step_loss = result.get('total_loss', result.get('loss', 0.0))
 
 
             else:
@@ -87,7 +83,7 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                     masked_features = hat_module.apply_mask(features, t_idx)
                     logits = model.fc(masked_features)
                 else:
-                    logits = model(x)
+                    logits = model(x.float())
 
                 # [V27] Pure Class-IL Training (Global Cross-Entropy)
                 # CHALLENGE: Distinguish current labels from all previously seen labels
@@ -113,10 +109,6 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                 if ewc_module:
                     loss += ewc_module.penalty()
                 
-                # --- HAT REGULARIZATION ---
-                if hat_module:
-                    loss += 0.75 * hat_module.reg_loss(t_idx)
-
                 loss.backward()
 
                 # --- AGEM PROJECTION ---
@@ -174,17 +166,18 @@ def validate(model, loader, seen_classes, device, is_antara=False, hat_module=No
     total_loss = 0
     with torch.no_grad():
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device).float(), y.to(device)
 
             if is_antara:
-                # Use inference_step for clean, diagnostic-free evaluation
+                # [V28] PURE CLASS-IL: We pass task_id=None to ensure zero leakage.
+                # This forces autonomous MoE routing and global head prediction.
                 try:
-                    logits = model.inference_step(x, task_id=t_idx)
+                    logits = model.inference_step(x, task_id=None)
                     if isinstance(logits, tuple):
                         logits = logits[0]
                 except Exception:
-                    # Fallback: direct forward, unpack tuple
-                    out = model(x, task_id=t_idx)
+                    # Fallback: direct forward, ensure no task-id guidance
+                    out = model(x, task_id=None)
                     logits = out[0] if isinstance(out, tuple) else out
             else:
                 if hat_module:
