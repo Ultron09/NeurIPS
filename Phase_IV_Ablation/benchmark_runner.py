@@ -65,8 +65,8 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             top_k_experts=2,
             use_moe=True,
             use_hierarchical_moe=True,
-            enable_consciousness=True, # [KILLSHOT] Enable System 2 Introspection
-            enable_world_model=True,   # [KILLSHOT] Predictive latent foresight
+            enable_consciousness=False, # [KILLSHOT] Enable System 2 Introspection
+            enable_world_model=False,   # [KILLSHOT] Predictive latent foresight
             use_ogd=True,
             ogd_max_basis_size=1024,
             iron_mind_quota=0.25,      # [KILLSHOT] Optimized for maximum plasticity
@@ -78,7 +78,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             si_lambda=1.5,             # [KILLSHOT] Stronger synaptic stability
             use_reptile=True,
             reptile_learning_rate=0.1,
-            use_learned_optimizer=True, # [KILLSHOT] Dynamic meta-optimization
+            use_learned_optimizer=False, # [KILLSHOT] Dynamic meta-optimization
             novelty_z_threshold=1.1,    # [KILLSHOT] More sensitive novelty detection
             adaptation_threshold=0.04,
             use_gradient_centralization=True,
