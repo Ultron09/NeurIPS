@@ -27,14 +27,21 @@ class SplitCIFAR100:
         self.pin_memory = pin_memory
         set_seed(seed)
         
-        # Standard CIFAR-100 Normalization
-        self.transform = transforms.Compose([
+        # [V29] Training augmentation: Standard CL benchmark transforms
+        self.train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+        ])
+        # Test/val: No augmentation
+        self.test_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
         ])
         
-        self.train_set = datasets.CIFAR100(root=root, train=True, download=True, transform=self.transform)
-        self.test_set = datasets.CIFAR100(root=root, train=False, download=True, transform=self.transform)
+        self.train_set = datasets.CIFAR100(root=root, train=True, download=True, transform=self.train_transform)
+        self.test_set = datasets.CIFAR100(root=root, train=False, download=True, transform=self.test_transform)
         
         # Deterministic class permutation
         self.classes = list(range(100))

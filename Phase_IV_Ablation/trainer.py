@@ -1,4 +1,3 @@
-import copy
 import time
 import torch
 import torch.nn.functional as F
@@ -14,8 +13,6 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
     - ANTARA path: delegates entirely to model.train_step() (full cognitive loop)
     - Baseline path: raw SGD loop for EWC, REPLAY, A-GEM, DER++, HAT, NAIVE
     """
-    best_loss = float('inf')
-    best_model = copy.deepcopy(model.state_dict())
     total_step_time = 0.0
     total_steps = 0
 
@@ -40,29 +37,27 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
             x, y = x.to(device), y.to(device)
 
             if is_antara:
-                # ============================================================
-                # ANTARA COGNITIVE PATH
-                # ============================================================
-                # Removed try-except to prevent silent failures. If this fails, we need to know.
-                result = model.train_step(x.float(), target_data=y,
-                                          task_id=t_idx, 
-                                          enable_dream=True,
-                                          meta_step=True,
-                                          record_stats=True)
-                step_loss = result.get('total_loss', result.get('loss', 0.0))
-
-                # [V29] EXTERNAL REPLAY: Inject old task data directly.
-                # The framework's internal dreaming stores metadata, not raw tensors.
-                # This bypasses it with a direct (x, y) replay step.
+                # [V29] MIXED-BATCH REPLAY: Combine old + new data into one step.
+                # Two separate steps cause gradient tug-of-war and halve Task N learning.
+                # One mixed batch lets the optimizer see a combined gradient.
                 if replay_buffer and len(replay_buffer) > 0:
-                    rx, ry = replay_buffer.sample(min(32, len(replay_buffer)))
+                    n_replay = min(max(t_idx * 8, 8), 48)  # Scale: 8→16→24→...→48
+                    rx, ry = replay_buffer.sample(n_replay)
                     rx, ry = rx.to(device).float(), ry.to(device)
-                    model.train_step(rx, target_data=ry,
-                                     task_id=t_idx,
-                                     enable_dream=False,
-                                     meta_step=False,
-                                     record_stats=False)
-
+                    mixed_x = torch.cat([x.float(), rx])
+                    mixed_y = torch.cat([y, ry])
+                    result = model.train_step(mixed_x, target_data=mixed_y,
+                                              task_id=t_idx,
+                                              enable_dream=True,
+                                              meta_step=True,
+                                              record_stats=True)
+                else:
+                    result = model.train_step(x.float(), target_data=y,
+                                              task_id=t_idx,
+                                              enable_dream=True,
+                                              meta_step=True,
+                                              record_stats=True)
+                step_loss = result.get('total_loss', result.get('loss', 0.0))
 
             else:
                 # ============================================================
@@ -157,17 +152,6 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
 
             total_step_time += (time.time() - start_time) * 1000  # to ms
             total_steps += 1
-
-        # [V9.2] Validation: Periodic check but NO early stopping
-        val_loss = validate(model, val_loader, seen_classes, device, is_antara=is_antara, hat_module=hat_module, t_idx=t_idx)
-        if val_loss < best_loss:
-            best_loss = val_loss
-            best_model = copy.deepcopy(model.state_dict())
-            
-    # [V29 FIX] DO NOT restore best_model checkpoint.
-    # Restoring overwrites Iron Mind sacred masks, SI importance paths,
-    # and all memory consolidation state that the framework accumulated
-    # during training. The framework's final state IS the correct state.
 
     avg_step_time = total_step_time / total_steps if total_steps > 0 else 0
     return avg_step_time
