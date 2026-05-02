@@ -42,11 +42,20 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     def model_factory():
         if dataset_name == "MNIST":
             m = resnet18(num_classes=10)
-            m.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            m.conv1 = torch.nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            m.maxpool = torch.nn.Identity()
             return m
         elif dataset_name == "TinyImageNet":
-            return resnet18(num_classes=200)
-        return resnet18(num_classes=100)
+            m = resnet18(num_classes=200)
+            # Optimize for 32x32/64x64: Remove aggressive downsampling
+            m.conv1 = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            m.maxpool = torch.nn.Identity()
+            return m
+        # CIFAR100 path
+        m = resnet18(num_classes=100)
+        m.conv1 = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        m.maxpool = torch.nn.Identity()
+        return m
 
     if dataset_name == "CIFAR100":
         curriculum = SplitCIFAR100(pin_memory=(device.type == "cuda"))
@@ -74,6 +83,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             num_experts=10,
             experts_per_domain=4,
             top_k_experts=2,
+            # [V26] NATIVE RESOLUTION: Restore to 64x64 for TinyImageNet
             use_moe=True,
             use_hierarchical_moe=True,
             enable_consciousness=True,
@@ -83,7 +93,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             iron_mind_quota=0.25,
             moe_temperature=1.0,
             moe_temp_decay=0.90,
-            input_dim=3072,
+            input_dim=12288 if dataset_name == "TinyImageNet" else 3072,
             learning_rate=2e-3,
             ewc_lambda=0.0,
             si_lambda=1.5,
@@ -108,7 +118,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             use_ogd=True,
             ogd_max_basis_size=1024,
             iron_mind_quota=0.15,
-            input_dim=3072,
+            input_dim=12288 if dataset_name == "TinyImageNet" else 3072,
             learning_rate=2e-3,
             ewc_lambda=0.0,
             si_lambda=0.0,             # No SI
@@ -126,7 +136,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             use_hierarchical_moe=False,
             use_ogd=False,
             iron_mind_quota=0.15,
-            input_dim=3072,
+            input_dim=12288 if dataset_name == "TinyImageNet" else 3072,
             learning_rate=2e-3,
             ewc_lambda=0.0,
             si_lambda=0.0,             # [ISOLATION] Disable SI
@@ -165,8 +175,8 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         der_module = DERPlus(model, buffer_size=2000, alpha=0.1)
     elif method_name == "HAT":
         hat_module = HAT(model, num_tasks=num_tasks).to(device)
-    elif method_name == "iCaRL":
-        icarl_module = iCaRL(model, buffer_size=2000, num_classes=100).to(device)
+        num_classes = 200 if dataset_name == "TinyImageNet" else (100 if dataset_name == "CIFAR100" else 10)
+        icarl_module = iCaRL(model, buffer_size=2000, num_classes=num_classes).to(device)
     elif method_name == "NAIVE":
         pass
     else:

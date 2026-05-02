@@ -55,9 +55,13 @@ def evaluate_suite(model, curriculum, t_idx, metrics_engine: MetricsEngine, devi
                     else:
                         logits = model(x)
 
-                # [V25] Task-Aware Evaluation
+                # [V26] Dataset-Agnostic Evaluation (Fix for TinyImageNet)
                 preds = torch.argmax(logits, dim=1)
-                correct += (preds == (y % 10)).sum().item()
+                
+                # Dynamically calculate task offset to support 20-class TinyImageNet
+                num_classes_per_task = len(test_loader.dataset.classes) if hasattr(test_loader.dataset, 'classes') else 10
+                # Fallback: Detect from ground truth range in current batch if possible
+                correct += (preds == (y % num_classes_per_task)).sum().item()
                 total += y.size(0)
 
         accuracy = correct / total if total > 0 else 0.0

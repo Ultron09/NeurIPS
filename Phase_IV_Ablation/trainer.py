@@ -19,8 +19,14 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
     total_step_time = 0.0
     total_steps = 0
 
-    # Global Output Boundaries (used by baseline path only)
-    seen_classes = (t_idx + 1) * 10
+    # Dynamically detect class density (Fix for TinyImageNet/MNIST/CIFAR)
+    if hasattr(train_loader.dataset, 'classes'):
+        classes_per_task = len(train_loader.dataset.classes)
+    else:
+        # Fallback to 10 for standard benchmarks if detection fails
+        classes_per_task = 10
+    
+    seen_classes = (t_idx + 1) * classes_per_task
 
     # --- BIFURCATION: Detect if model is Antara AdaptiveFramework ---
     is_antara = hasattr(model, 'train_step') and hasattr(model, 'consolidate_memory')
@@ -86,10 +92,10 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                 # [V9.4] Task-Adaptive Logit Masking (NeurIPS Killshot)
                 # Ensure the loss only focuses on current task classes to prevent 
                 # aggressive suppression of past task knowledge.
-                start_cls = t_idx * 10
-                end_cls = (t_idx + 1) * 10
+                start_cls = t_idx * classes_per_task
+                end_cls = (t_idx + 1) * classes_per_task
                 task_logits = logits[:, start_cls:end_cls]
-                task_y = y % 10 # Map [10-19] to [0-9]
+                task_y = y % classes_per_task # Map global labels to local task index
                 
                 loss = F.cross_entropy(task_logits, task_y)
 
@@ -207,8 +213,8 @@ def validate(model, loader, seen_classes, device, is_antara=False, hat_module=No
             # [V26.2] Safe slicing: only score over classes seen so far
             # For Antara, logits are already sliced to 10 if task_id was passed
             loss_y = y
-            if is_antara and logits.shape[1] == 10:
-                loss_y = y % 10
+            if is_antara and logits.shape[1] == classes_per_task:
+                loss_y = y % classes_per_task
             
             effective_classes = min(seen_classes, logits.shape[1])
             total_loss += F.cross_entropy(logits[:, :effective_classes], loss_y).item()

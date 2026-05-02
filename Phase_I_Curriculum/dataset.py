@@ -123,11 +123,10 @@ class SplitTinyImageNet:
         self.pin_memory = pin_memory
         set_seed(seed)
         
-        # TinyImageNet (64x64) -> Resize to 32x32 for architectural consistency
+        # [V26] NATIVE RESOLUTION: Use 64x64 for TinyImageNet (NeurIPS Killshot)
         self.transform = transforms.Compose([
-            transforms.Resize((32, 32)),
             transforms.ToTensor(),
-            transforms.Normalize((0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262))
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         ])
         
         # TinyImageNet usually requires ImageFolder structure
