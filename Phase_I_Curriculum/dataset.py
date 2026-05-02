@@ -106,16 +106,61 @@ class SplitMNIST:
 
 
 class SplitTinyImageNet:
-    """Stub for TinyImageNet (200 classes, 10 tasks, 20 classes/task)."""
+    """
+    Split-TinyImageNet-200 Curriculum.
+    200 classes partitioned into 10 sequential tasks (20 classes each).
+    Expects data at {root}/tiny-imagenet-200/
+    """
     def __init__(self, root='./data', seed=42, batch_size=64, pin_memory=False):
         self.root = root
         self.batch_size = batch_size
         self.pin_memory = pin_memory
         set_seed(seed)
-        # In a real run, this would load the downloaded TinyImageNet files.
-        # For now, it raises an error or falls back to CIFAR if data is missing.
-        print("WARNING: TinyImageNet requires local dataset download. Falling back to internal logic.")
-        self.task_classes = [list(range(i, i+20)) for i in range(0, 200, 20)]
+        
+        # TinyImageNet (64x64) Normalization
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262))
+        ])
+        
+        # TinyImageNet usually requires ImageFolder structure
+        # Expected structure: root/tiny-imagenet-200/train/n01234567/images/
+        train_dir = Path(root) / "tiny-imagenet-200" / "train"
+        test_dir = Path(root) / "tiny-imagenet-200" / "val" # Using val as test for CL
+        
+        if not train_dir.exists():
+            # [V26.5] Robust Fallback: Attempt to use whatever is in 'data' or warn
+            print(f"CRITICAL: TinyImageNet not found at {train_dir}. Reviewers require this benchmark.")
+            # We don't raise here to allow the runner to initialize, but get_task will fail
+            self.train_set = None
+            self.test_set = None
+        else:
+            self.train_set = datasets.ImageFolder(root=str(train_dir), transform=self.transform)
+            self.test_set = datasets.ImageFolder(root=str(test_dir), transform=self.transform)
+            
+            # Map classes to 0-199
+            self.classes = list(range(200))
+            random.shuffle(self.classes)
+            
+            self.task_classes = [list(range(i, i+20)) for i in range(0, 200, 20)]
 
     def get_task(self, task_id):
-        raise NotImplementedError("TinyImageNet requires manual dataset path configuration.")
+        if self.train_set is None:
+            raise FileNotFoundError("TinyImageNet dataset files missing. Please download to ./data/tiny-imagenet-200/")
+            
+        if task_id < 0 or task_id >= 10:
+            raise ValueError("Task ID must be between 0 and 9")
+            
+        target_classes = self.task_classes[task_id]
+        
+        # ImageFolder targets are class indices [0-199] based on folder order
+        train_indices = [i for i, label in enumerate(self.train_set.targets) if label in target_classes]
+        test_indices = [i for i, label in enumerate(self.test_set.targets) if label in target_classes]
+        
+        split = int(0.9 * len(train_indices))
+        t_idx = train_indices[:split]
+        v_idx = train_indices[split:]
+        
+        return DataLoader(Subset(self.train_set, t_idx), batch_size=self.batch_size, shuffle=True, pin_memory=self.pin_memory), \
+               DataLoader(Subset(self.train_set, v_idx), batch_size=self.batch_size, shuffle=False, pin_memory=self.pin_memory), \
+               DataLoader(Subset(self.test_set, test_indices), batch_size=self.batch_size, shuffle=False, pin_memory=self.pin_memory)

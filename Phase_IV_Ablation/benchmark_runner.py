@@ -10,7 +10,7 @@ from torchvision.models import resnet18
 for d in ['Phase_I_Curriculum', 'Phase_II_Baselines', 'Phase_III_Metrics']:
     sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), d))
 
-from dataset import SplitCIFAR100, SplitMNIST, set_seed
+from dataset import SplitCIFAR100, SplitMNIST, SplitTinyImageNet, set_seed
 from baselines import EWC, ExperienceReplay, AGEM, DERPlus, HAT, iCaRL
 from metrics import MetricsEngine
 from trainer import train_single_task
@@ -40,10 +40,19 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         })
 
     def model_factory():
+        if dataset_name == "MNIST":
+            m = resnet18(num_classes=10)
+            m.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            return m
+        elif dataset_name == "TinyImageNet":
+            return resnet18(num_classes=200)
         return resnet18(num_classes=100)
 
     if dataset_name == "CIFAR100":
         curriculum = SplitCIFAR100(pin_memory=(device.type == "cuda"))
+        num_tasks = 10
+    elif dataset_name == "TinyImageNet":
+        curriculum = SplitTinyImageNet(pin_memory=(device.type == "cuda"))
         num_tasks = 10
     else:
         curriculum = SplitMNIST(pin_memory=(device.type == "cuda"))
@@ -58,55 +67,38 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
     icarl_module = None
     config = None
 
-    if method_name == "ANTARA_FULL":
-        config = AdaptiveFrameworkConfig(
-            model_dim=256,
-            num_experts=16,            # [KILLSHOT] Increased expert density for O(1) scaling
-            top_k_experts=2,
-            use_moe=True,
-            use_hierarchical_moe=True,
-            enable_consciousness=False, # [KILLSHOT] Enable System 2 Introspection
-            enable_world_model=False,   # [KILLSHOT] Predictive latent foresight
-            use_ogd=True,
-            ogd_max_basis_size=1024,
-            iron_mind_quota=0.25,      # [KILLSHOT] Optimized for maximum plasticity
-            moe_temperature=1.0,
-            moe_temp_decay=0.90,       # [KILLSHOT] Slower sharpening for better generalization
-            input_dim=3072,
-            learning_rate=2e-3,
-            ewc_lambda=0.0,
-            si_lambda=1.5,             # [KILLSHOT] Stronger synaptic stability
-            use_reptile=True,
-            reptile_learning_rate=0.1,
-            use_learned_optimizer=False, # [KILLSHOT] Dynamic meta-optimization
-            novelty_z_threshold=1.1,    # [KILLSHOT] More sensitive novelty detection
-            adaptation_threshold=0.04,
-            use_gradient_centralization=True,
-            use_lookahead=True
-        )
-        model = AdaptiveFramework(model, config=config, device=device)
-    elif method_name == "ANTARA_RGW_ONLY":
+    if method_name == "ANTARA_SENTIENT":
+        # [SENTIENT EDITION] Full Cognitive Suite (Iron Mind V26.5)
         config = AdaptiveFrameworkConfig(
             model_dim=256,
             num_experts=10,
+            experts_per_domain=4,
             top_k_experts=2,
             use_moe=True,
             use_hierarchical_moe=True,
-            use_ogd=False,
+            enable_consciousness=True,
+            enable_world_model=True,
+            use_ogd=True,
+            ogd_max_basis_size=1024,
+            iron_mind_quota=0.25,
+            moe_temperature=1.0,
+            moe_temp_decay=0.90,
             input_dim=3072,
             learning_rate=2e-3,
             ewc_lambda=0.0,
-            si_lambda=1.0,
+            si_lambda=1.5,
             use_reptile=True,
             reptile_learning_rate=0.1,
-            use_learned_optimizer=False,
-            novelty_z_threshold=1.2,
-            adaptation_threshold=0.05,
+            use_learned_optimizer=True,
             use_gradient_centralization=True,
-            use_lookahead=True
+            use_lookahead=True,
+            use_prioritized_replay=False,
+            enable_dreaming=False
         )
         model = AdaptiveFramework(model, config=config, device=device)
-    elif method_name == "ANTARA_OGD_ONLY":
+    elif method_name == "ANTARA_TRIFOLD":
+        # [CORE EDITION] Tri-Fold Manifold (Static + Geometric + Architectural)
+        # As described in the NeurIPS submission.
         config = AdaptiveFrameworkConfig(
             model_dim=256,
             num_experts=10,
@@ -119,13 +111,48 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
             input_dim=3072,
             learning_rate=2e-3,
             ewc_lambda=0.0,
-            si_lambda=1.0,
-            use_reptile=False,
+            si_lambda=0.0,             # No SI
+            use_reptile=False,          # No Reptile
+            use_learned_optimizer=False, # No L2O
+            use_gradient_centralization=False,
+            use_lookahead=False
+        )
+        model = AdaptiveFramework(model, config=config, device=device)
+    elif method_name == "ANTARA_RGW_ONLY":
+        # [ISOLATION] Pure Structural Masking (Static Gate)
+        config = AdaptiveFrameworkConfig(
+            model_dim=256,
+            use_moe=False,
+            use_hierarchical_moe=False,
+            use_ogd=False,
+            iron_mind_quota=0.15,
+            input_dim=3072,
+            learning_rate=2e-3,
+            ewc_lambda=0.0,
+            si_lambda=0.0,             # [ISOLATION] Disable SI
+            use_reptile=False,          # [ISOLATION] Disable Reptile
             use_learned_optimizer=False,
-            novelty_z_threshold=1.2,
-            adaptation_threshold=0.05,
-            use_gradient_centralization=True,
-            use_lookahead=True
+            use_gradient_centralization=False,
+            use_lookahead=False
+        )
+        model = AdaptiveFramework(model, config=config, device=device)
+    elif method_name == "ANTARA_OGD_ONLY":
+        # [ISOLATION] Pure Geometric Projection (Geometric Gate)
+        config = AdaptiveFrameworkConfig(
+            model_dim=256,
+            use_moe=False,
+            use_hierarchical_moe=False,
+            use_ogd=True,
+            ogd_max_basis_size=1024,
+            iron_mind_quota=0.0,         # [ISOLATION] Disable Masking
+            input_dim=3072,
+            learning_rate=2e-3,
+            ewc_lambda=0.0,
+            si_lambda=0.0,             # [ISOLATION] Disable SI
+            use_reptile=False,          # [ISOLATION] Disable Reptile
+            use_learned_optimizer=False,
+            use_gradient_centralization=False,
+            use_lookahead=False
         )
         model = AdaptiveFramework(model, config=config, device=device)
     elif method_name == "EWC":
@@ -208,8 +235,8 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", type=str, required=True,
-                        choices=["ANTARA_FULL", "ANTARA_RGW_ONLY", "ANTARA_OGD_ONLY", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE", "iCaRL"])
-    parser.add_argument("--dataset", type=str, default="CIFAR100", choices=["CIFAR100", "MNIST"])
+                        choices=["ANTARA_SENTIENT", "ANTARA_TRIFOLD", "ANTARA_RGW_ONLY", "ANTARA_OGD_ONLY", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE", "iCaRL"])
+    parser.add_argument("--dataset", type=str, default="CIFAR100", choices=["CIFAR100", "MNIST", "TinyImageNet"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb", action="store_true")
