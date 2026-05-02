@@ -153,23 +153,39 @@ class SplitTinyImageNet:
         self.task_classes = [list(range(i, i+20)) for i in range(0, 200, 20)]
 
     def _download_and_extract(self):
-        """Downloads and extracts the TinyImageNet-200 dataset."""
-        print(f"  [SYSTEM] TinyImageNet not found. Downloading from Stanford...")
+        """Downloads, extracts, and REFORMATS TinyImageNet-200."""
+        print(f"  [SYSTEM] TinyImageNet not found in {self.tiny_dir}")
+        print(f"  [SYSTEM] Attempting download from Stanford mirrors...")
         self.root_path.mkdir(parents=True, exist_ok=True)
         url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
         zip_path = self.root_path / "tiny-imagenet-200.zip"
         
-        # Download with progress indication
-        urllib.request.urlretrieve(url, zip_path)
-        print(f"  [SYSTEM] Download complete. Extracting...")
-        
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(self.root_path)
+        try:
+            urllib.request.urlretrieve(url, zip_path)
+            print(f"  [SYSTEM] Download complete. Extracting...")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(self.root_path)
             
-        # Cleanup
-        if zip_path.exists():
-            os.remove(zip_path)
-        print(f"  [SYSTEM] TinyImageNet ready.")
+            # [REFORMATTING LOGIC] Move val images to class folders (The PyPI Fix)
+            val_dir = self.tiny_dir / "val"
+            val_images_dir = val_dir / "images"
+            val_annotations = val_dir / "val_annotations.txt"
+            
+            print(f"  [SYSTEM] Reformatting validation set for ImageFolder compatibility...")
+            with open(val_annotations, 'r') as f:
+                for line in f:
+                    parts = line.strip().split('\t')
+                    img_name, class_id = parts[0], parts[1]
+                    target_dir = val_dir / class_id / "images"
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    os.rename(val_images_dir / img_name, target_dir / img_name)
+            
+            if val_images_dir.exists(): os.rmdir(val_images_dir)
+            if zip_path.exists(): os.remove(zip_path)
+            print(f"  [SYSTEM] TinyImageNet ready and reformatted.")
+        except Exception as e:
+            print(f"  [CRITICAL] Data Setup Failed: {e}")
+            raise e
 
     def get_task(self, task_id):
         if self.train_set is None:
