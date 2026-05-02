@@ -153,17 +153,34 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     start_time = time.time()
     torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
 
+    initial_accuracies = []
+    final_accuracies = []
+
     for t_idx in range(num_tasks):
         train_loader, _, _ = curriculum.get_task(t_idx)
         test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
         trainer.train_task(train_loader, t_idx, epochs=10)
+        
+        # Capture Task Accuracies
         task_accuracies = [evaluator.evaluate(loader, i) for i, loader in enumerate(test_loaders)]
+        initial_accuracies.append(task_accuracies[t_idx]) 
+        
         avg_acc = sum(task_accuracies) / len(task_accuracies)
-        print(f"Task {t_idx} AA: {avg_acc:.2%}"); results.append(avg_acc)
-    
+        acc_str = ", ".join([f"T{i}: {acc:.2%}" for i, acc in enumerate(task_accuracies)])
+        print(f"\n[LIVE_DEBUG] Task {t_idx} Finished | Average Accuracy: {avg_acc:.2%}")
+        print(f"             Accuracies: [{acc_str}]")
+        results.append(avg_acc)
+        
+        if t_idx == num_tasks - 1:
+            final_accuracies = task_accuracies
+
     total_time = time.time() - start_time
     usage = get_resource_usage()
-    final_avg = results[-1]; bwt = (results[-1] - results[0])
+    
+    # CALCULATE RIGOROUS BWT
+    forgetting = [final_accuracies[i] - initial_accuracies[i] for i in range(num_tasks - 1)]
+    bwt = sum(forgetting) / len(forgetting) if len(forgetting) > 0 else 0.0
+    final_avg = results[-1]
     
     report = (
         f"Result File: {filename}\n"
