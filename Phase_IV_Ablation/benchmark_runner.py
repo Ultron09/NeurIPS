@@ -153,6 +153,14 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
         trainer.train_task(train_loader, t_idx, epochs=10)
         
+        # [V29] CRITICAL: Signal end-of-task to framework.
+        # This finalizes SI importance, builds Iron Mind sacred mask,
+        # and populates the restoration cache. Without this, the framework
+        # has NO knowledge of what to protect.
+        if hasattr(model, 'consolidate_memory'):
+            model.consolidate_memory()
+            print(f"             [CONSOLIDATE] Task {t_idx} knowledge locked.")
+        
         # Capture Task Accuracies
         task_accuracies = [evaluator.evaluate(loader, i) for i, loader in enumerate(test_loaders)]
         initial_accuracies.append(task_accuracies[t_idx]) 
