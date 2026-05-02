@@ -4,6 +4,9 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
 import random
 from pathlib import Path
+import os
+import urllib.request
+import zipfile
 
 def set_seed(seed=42):
     torch.manual_seed(seed)
@@ -126,24 +129,45 @@ class SplitTinyImageNet:
         
         # TinyImageNet usually requires ImageFolder structure
         # Expected structure: root/tiny-imagenet-200/train/n01234567/images/
-        train_dir = Path(root) / "tiny-imagenet-200" / "train"
-        test_dir = Path(root) / "tiny-imagenet-200" / "val" # Using val as test for CL
+        self.root_path = Path(root)
+        self.tiny_dir = self.root_path / "tiny-imagenet-200"
+        
+        if not self.tiny_dir.exists():
+            self._download_and_extract()
+            
+        train_dir = self.tiny_dir / "train"
+        test_dir = self.tiny_dir / "val" # Using val as test for CL
         
         if not train_dir.exists():
-            # [V26.5] Robust Fallback: Attempt to use whatever is in 'data' or warn
-            print(f"CRITICAL: TinyImageNet not found at {train_dir}. Reviewers require this benchmark.")
-            # We don't raise here to allow the runner to initialize, but get_task will fail
-            self.train_set = None
-            self.test_set = None
-        else:
-            self.train_set = datasets.ImageFolder(root=str(train_dir), transform=self.transform)
-            self.test_set = datasets.ImageFolder(root=str(test_dir), transform=self.transform)
+            raise FileNotFoundError(f"TinyImageNet train directory not found at {train_dir} even after download attempt.")
             
-            # Map classes to 0-199
-            self.classes = list(range(200))
-            random.shuffle(self.classes)
+        self.train_set = datasets.ImageFolder(root=str(train_dir), transform=self.transform)
+        self.test_set = datasets.ImageFolder(root=str(test_dir), transform=self.transform)
+        
+        # Map classes to 0-199
+        self.classes = list(range(200))
+        random.shuffle(self.classes)
+        
+        self.task_classes = [list(range(i, i+20)) for i in range(0, 200, 20)]
+
+    def _download_and_extract(self):
+        """Downloads and extracts the TinyImageNet-200 dataset."""
+        print(f"  [SYSTEM] TinyImageNet not found. Downloading from Stanford...")
+        self.root_path.mkdir(parents=True, exist_ok=True)
+        url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+        zip_path = self.root_path / "tiny-imagenet-200.zip"
+        
+        # Download with progress indication
+        urllib.request.urlretrieve(url, zip_path)
+        print(f"  [SYSTEM] Download complete. Extracting...")
+        
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(self.root_path)
             
-            self.task_classes = [list(range(i, i+20)) for i in range(0, 200, 20)]
+        # Cleanup
+        if zip_path.exists():
+            os.remove(zip_path)
+        print(f"  [SYSTEM] TinyImageNet ready.")
 
     def get_task(self, task_id):
         if self.train_set is None:
