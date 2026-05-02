@@ -89,15 +89,9 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                 else:
                     logits = model(x)
 
-                # [V9.4] Task-Adaptive Logit Masking (NeurIPS Killshot)
-                # Ensure the loss only focuses on current task classes to prevent 
-                # aggressive suppression of past task knowledge.
-                start_cls = t_idx * classes_per_task
-                end_cls = (t_idx + 1) * classes_per_task
-                task_logits = logits[:, start_cls:end_cls]
-                task_y = y % classes_per_task # Map global labels to local task index
-                
-                loss = F.cross_entropy(task_logits, task_y)
+                # [V27] Pure Class-IL Training (Global Cross-Entropy)
+                # CHALLENGE: Distinguish current labels from all previously seen labels
+                loss = F.cross_entropy(logits[:, :seen_classes], y)
 
                 # --- HAT REGULARIZATION ---
                 if hat_module:
@@ -210,11 +204,8 @@ def validate(model, loader, seen_classes, device, is_antara=False, hat_module=No
                 else:
                     logits = model(x)
 
-            # [V26.2] Safe slicing: only score over classes seen so far
-            # For Antara, logits are already sliced to 10 if task_id was passed
+            # Class-IL Validation: No label modulo
             loss_y = y
-            if is_antara and logits.shape[1] == classes_per_task:
-                loss_y = y % classes_per_task
             
             effective_classes = min(seen_classes, logits.shape[1])
             total_loss += F.cross_entropy(logits[:, :effective_classes], loss_y).item()

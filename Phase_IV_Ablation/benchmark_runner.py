@@ -1,258 +1,121 @@
-import argparse
-import time
-import sys
 import os
+import sys
 import torch
-import copy
-from torchvision.models import resnet18
-
-# Path setup to import from other phases and local framework
-for d in ['Phase_I_Curriculum', 'Phase_II_Baselines', 'Phase_III_Metrics']:
-    sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), d))
-
-from dataset import SplitCIFAR100, SplitMNIST, SplitTinyImageNet, set_seed
-from baselines import EWC, ExperienceReplay, AGEM, DERPlus, HAT, iCaRL
-from metrics import MetricsEngine
-from trainer import train_single_task
-from evaluation import evaluate_suite
+import torch.nn as nn
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 
-def setup_compute(device_str):
-    if device_str == "cuda" and torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        return torch.device("cuda")
-    return torch.device("cpu")
+# [V28] PATH INJECTION: Ensure sibling modules (Metrics, Data) are discoverable
+root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if root_path not in sys.path:
+    sys.path.append(root_path)
+    sys.path.append(os.path.join(root_path, "Phase_III_Metrics"))
+    sys.path.append(os.path.join(root_path, "Phase_I_Curriculum"))
 
-def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS", entity=None, suffix="", seed=42, dataset_name="CIFAR100"):
-    set_seed(seed)
-    device = setup_compute(device_str)
-    full_method_name = f"{method_name}{suffix}_seed{seed}"
+from trainer import train_single_task
+from evaluation import evaluate_suite
+from dataset import SplitCIFAR100, SplitTinyImageNet
 
-    print(f"\n[NEURIPS GAUNTLET] Executing Branch: {full_method_name}")
-    print(f"  [SYSTEM] Active Compute Device: {device}")
+class ContinualTrainer:
+    def __init__(self, model, device='cuda'):
+        self.model = model
+        self.device = device
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=getattr(model.config, 'learning_rate', 2e-3))
 
-    if wandb_sync:
-        import wandb
-        wandb.init(project=project, entity=entity, name=full_method_name, config={
-            "method": method_name,
-            "seed": seed,
-            "device": str(device)
-        })
+    def train_task(self, loader, t_idx, epochs=3):
+        return train_single_task(self.model, loader, loader, self.optimizer, t_idx, device=self.device, epochs=epochs)
 
-    def model_factory():
-        if dataset_name == "MNIST":
-            m = resnet18(num_classes=10)
-            m.conv1 = torch.nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
-            m.maxpool = torch.nn.Identity()
-            return m
-        elif dataset_name == "TinyImageNet":
-            m = resnet18(num_classes=200)
-            # Optimize for 32x32/64x64: Remove aggressive downsampling
-            m.conv1 = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-            m.maxpool = torch.nn.Identity()
-            return m
-        # CIFAR100 path
-        m = resnet18(num_classes=100)
-        m.conv1 = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        m.maxpool = torch.nn.Identity()
-        return m
+class ContinualEvaluator:
+    def __init__(self, model, device='cuda'):
+        self.model = model
+        self.device = device
 
+    def evaluate(self, loader, t_idx):
+        self.model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for x, y in loader:
+                x, y = x.to(self.device), y.to(self.device)
+                if hasattr(self.model, 'inference_step'):
+                    logits = self.model.inference_step(x)
+                else:
+                    logits = self.model(x)
+                if isinstance(logits, tuple): logits = logits[0]
+                preds = torch.argmax(logits, dim=1)
+                correct += (preds == y).sum().item()
+                total += y.size(0)
+        return correct / total if total > 0 else 0.0
+
+def model_factory(dataset_name, num_classes=100):
+    from torchvision.models import resnet18
+    model = resnet18(num_classes=num_classes)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.maxpool = nn.Identity()
+    return model
+
+def get_stage_config(stage_id: int, dataset_name: str):
+    base_params = {
+        "model_dim": 256,
+        "num_experts": 10,
+        "experts_per_domain": 4,
+        "top_k_experts": 2,
+        "input_dim": 12288 if dataset_name == "TinyImageNet" else 3072,
+        "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
+        "learning_rate": 2e-3,
+        "use_gradient_centralization": True,
+        "use_lookahead": True,
+        "moe_temperature": 1.0,
+        "moe_temp_decay": 0.90,
+    }
+    if stage_id == 1: return AdaptiveFrameworkConfig(**base_params, use_moe=False, si_lambda=0.0, use_reptile=False, enable_world_model=False, enable_consciousness=False)
+    elif stage_id == 2: return AdaptiveFrameworkConfig(**base_params, use_moe=False, si_lambda=1.5, use_reptile=False, enable_world_model=False, enable_consciousness=False)
+    elif stage_id == 3: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, use_reptile=False, enable_world_model=False, enable_consciousness=False)
+    elif stage_id == 4: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=False, enable_world_model=False)
+    elif stage_id == 5: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, reptile_learning_rate=0.1, enable_world_model=False)
+    elif stage_id == 6: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True)
+    elif stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, iron_mind_quota=0.25)
+    return AdaptiveFrameworkConfig(**base_params)
+
+def run_experiment(dataset_name="CIFAR100", stage_id=7):
+    print(f"\n{'='*60}\nSTARTING ANTARA NEURIPS ABLATION: STAGE {stage_id} on {dataset_name}\n{'='*60}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if dataset_name == "CIFAR100":
-        curriculum = SplitCIFAR100(pin_memory=(device.type == "cuda"))
-        num_tasks = 10
-    elif dataset_name == "TinyImageNet":
-        curriculum = SplitTinyImageNet(pin_memory=(device.type == "cuda"))
-        num_tasks = 10
+        curriculum = SplitCIFAR100(); num_classes = 100; num_tasks = 10
     else:
-        curriculum = SplitMNIST(pin_memory=(device.type == "cuda"))
-        num_tasks = 5
-    model = model_factory().to(device)
-
-    ewc_module = None
-    replay_buffer = None
-    agem_module = None
-    der_module = None
-    hat_module = None
-    icarl_module = None
-    config = None
-
-    if method_name == "ANTARA_SENTIENT":
-        # [SENTIENT EDITION] Full Cognitive Suite (Iron Mind V26.5)
-        config = AdaptiveFrameworkConfig(
-            model_dim=256,
-            num_experts=10,
-            experts_per_domain=4,
-            top_k_experts=2,
-            # [V26] NATIVE RESOLUTION: Restore to 64x64 for TinyImageNet
-            use_moe=True,
-            use_hierarchical_moe=True,
-            enable_consciousness=True,
-            enable_world_model=True,
-            use_ogd=False,
-            ogd_max_basis_size=1024,
-            iron_mind_quota=0.25,
-            moe_temperature=1.0,
-            moe_temp_decay=0.90,
-            input_dim=12288 if dataset_name == "TinyImageNet" else 3072,
-            learning_rate=2e-3,
-            ewc_lambda=0.0,
-            si_lambda=1.5,
-            use_reptile=True,
-            reptile_learning_rate=0.1,
-            use_learned_optimizer=False,
-            use_gradient_centralization=True,
-            use_lookahead=True,
-            use_prioritized_replay=False,
-            enable_dreaming=False
-        )
-        model = AdaptiveFramework(model, config=config, device=device)
-    elif method_name == "ANTARA_TRIFOLD":
-        # [CORE EDITION] Tri-Fold Manifold (Static + Geometric + Architectural)
-        # As described in the NeurIPS submission.
-        config = AdaptiveFrameworkConfig(
-            model_dim=256,
-            num_experts=10,
-            top_k_experts=2,
-            use_moe=True,
-            use_hierarchical_moe=True,
-            use_ogd=True,
-            ogd_max_basis_size=1024,
-            iron_mind_quota=0.15,
-            input_dim=12288 if dataset_name == "TinyImageNet" else 3072,
-            learning_rate=2e-3,
-            ewc_lambda=0.0,
-            si_lambda=0.0,             # No SI
-            use_reptile=False,          # No Reptile
-            use_learned_optimizer=False, # No L2O
-            use_gradient_centralization=False,
-            use_lookahead=False
-        )
-        model = AdaptiveFramework(model, config=config, device=device)
-    elif method_name == "ANTARA_RGW_ONLY":
-        # [ISOLATION] Pure Structural Masking (Static Gate)
-        config = AdaptiveFrameworkConfig(
-            model_dim=256,
-            use_moe=False,
-            use_hierarchical_moe=False,
-            use_ogd=False,
-            iron_mind_quota=0.15,
-            input_dim=12288 if dataset_name == "TinyImageNet" else 3072,
-            learning_rate=2e-3,
-            ewc_lambda=0.0,
-            si_lambda=0.0,             # [ISOLATION] Disable SI
-            use_reptile=False,          # [ISOLATION] Disable Reptile
-            use_learned_optimizer=False,
-            use_gradient_centralization=False,
-            use_lookahead=False
-        )
-        model = AdaptiveFramework(model, config=config, device=device)
-    elif method_name == "ANTARA_OGD_ONLY":
-        # [ISOLATION] Pure Geometric Projection (Geometric Gate)
-        config = AdaptiveFrameworkConfig(
-            model_dim=256,
-            use_moe=False,
-            use_hierarchical_moe=False,
-            use_ogd=True,
-            ogd_max_basis_size=1024,
-            iron_mind_quota=0.0,         # [ISOLATION] Disable Masking
-            input_dim=3072,
-            learning_rate=2e-3,
-            ewc_lambda=0.0,
-            si_lambda=0.0,             # [ISOLATION] Disable SI
-            use_reptile=False,          # [ISOLATION] Disable Reptile
-            use_learned_optimizer=False,
-            use_gradient_centralization=False,
-            use_lookahead=False
-        )
-        model = AdaptiveFramework(model, config=config, device=device)
-    elif method_name == "EWC":
-        ewc_module = EWC(model, lambda_factor=5000)
-    elif method_name == "REPLAY":
-        replay_buffer = ExperienceReplay(buffer_size=2000)
-    elif method_name == "A-GEM":
-        agem_module = AGEM(model, buffer_size=2000)
-    elif method_name == "DER++":
-        der_module = DERPlus(model, buffer_size=2000, alpha=0.1)
-    elif method_name == "HAT":
-        hat_module = HAT(model, num_tasks=num_tasks).to(device)
-        num_classes = 200 if dataset_name == "TinyImageNet" else (100 if dataset_name == "CIFAR100" else 10)
-        icarl_module = iCaRL(model, buffer_size=2000, num_classes=num_classes).to(device)
-    elif method_name == "NAIVE":
-        pass
-    else:
-        raise ValueError(f"Invalid experiment method: {method_name}")
-
-    is_antara = method_name.startswith("ANTARA")
-
-    if is_antara:
-        print("  [SYSTEM] Initializing Neuro-Stability V15 IRON MIND (Native Package Edition)...")
-
-    # =========================================================================
-    # MAIN TRAINING LOOP
-    # =========================================================================
-    optimizer = None if is_antara else torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-    metrics   = MetricsEngine(num_tasks=num_tasks, config_name=full_method_name)
-    total_start_time  = time.time()
-    task_step_times   = []
-
+        curriculum = SplitTinyImageNet(); num_classes = 200; num_tasks = 10
+    config = get_stage_config(stage_id, dataset_name)
+    backbone = model_factory(dataset_name, num_classes=num_classes)
+    model = AdaptiveFramework(backbone, config=config).to(device)
+    trainer = ContinualTrainer(model, device=device)
+    evaluator = ContinualEvaluator(model, device=device)
+    results = []
     for t_idx in range(num_tasks):
-        train_loader, val_loader, _ = curriculum.get_task(t_idx)
-
-        avg_step_time = train_single_task(
-            model, train_loader, val_loader, optimizer, t_idx,
-            device=device, ewc_module=ewc_module,
-            agem_module=agem_module, replay_buffer=replay_buffer,
-            der_module=der_module, hat_module=hat_module,
-            epochs=10
-        )
-        task_step_times.append(avg_step_time)
-
-        if method_name == "EWC":
-            ewc_module.save_task_weights(train_loader, device=device)
-        elif method_name == "HAT":
-            hat_module.update_cumulative_mask(t_idx)
-        elif method_name == "iCaRL":
-            for c in curriculum.task_classes[t_idx]:
-                icarl_module.update_exemplars(train_loader.dataset, c, device=device)
-            icarl_module.compute_means(device=device)
-
-        if is_antara:
-            model.on_task_complete(t_idx)
-
-        evaluate_suite(model, curriculum, t_idx, metrics, device=device, hat_module=hat_module)
-
-    # =========================================================================
-    # FINALIZE
-    # =========================================================================
-    total_duration = time.time() - total_start_time
-    metrics.avg_step_time_ms        = (sum(task_step_times) / len(task_step_times))
-    metrics.total_compute_time_sec  = total_duration
-    if device.type == "cuda":
-        metrics.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-
-    results_path = f"results/{full_method_name}_metrics.json"
-    metrics.save_results(results_path)
-    metrics.plot_heatmap(f"results/{full_method_name}_heatmap.png")
-    metrics.generate_summary_report()
-
-    print(f"\n[GAUNTLET COMPLETE] Method: {full_method_name}")
-    print(f"  Total Duration: {total_duration/60:.2f} minutes")
-    print(f"  Avg Step Time: {sum(task_step_times)/len(task_step_times):.4f}s")
-
-    if wandb_sync:
-        wandb.finish()
+        train_loader, _, _ = curriculum.get_task(t_idx)
+        test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
+        classes_per_task = num_classes // num_tasks
+        print(f"\n--- Task {t_idx} (Classes {t_idx*classes_per_task}-{((t_idx+1)*classes_per_task)-1}) ---")
+        trainer.train_task(train_loader, t_idx, epochs=3)
+        task_accuracies = [evaluator.evaluate(loader, i) for i, loader in enumerate(test_loaders)]
+        avg_acc = sum(task_accuracies) / len(task_accuracies)
+        print(f"Task {t_idx} Complete. Avg Class-IL Accuracy: {avg_acc:.2%}")
+        results.append(avg_acc)
+    final_avg = results[-1]; bwt = (results[-1] - results[0])
+    report = f"\nFinal NeurIPS Report (Stage {stage_id}, {dataset_name}):\n  Avg Accuracy: {final_avg:.2%}\n  BWT: {bwt:.2%}\n"
+    print(report)
+    
+    # [V28] FAIL-SAFE LOGGING
+    with open("neurips_results.txt", "a") as f:
+        f.write(report + "="*30 + "\n")
+        
+    return results
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--method", type=str, required=True,
-                        choices=["ANTARA_SENTIENT", "ANTARA_TRIFOLD", "ANTARA_RGW_ONLY", "ANTARA_OGD_ONLY", "EWC", "REPLAY", "A-GEM", "DER++", "HAT", "NAIVE", "iCaRL"])
-    parser.add_argument("--dataset", type=str, default="CIFAR100", choices=["CIFAR100", "MNIST", "TinyImageNet"])
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--project", type=str, default="NeurIPS")
-    parser.add_argument("--entity", type=str, default="ultron09-airbornehrs")
-    parser.add_argument("--suffix", type=str, default="")
+    import argparse
+    parser = argparse.ArgumentParser(description="ANTARA Distributed Blitz Runner")
+    parser.add_argument("--stages", type=int, nargs="+", required=True, help="List of Stages to run (e.g., 7 6)")
     args = parser.parse_args()
-
-    run_experiment(args.method, args.device, args.wandb, args.project, args.entity, args.suffix, args.seed, args.dataset)
+    
+    # Automate Dataset Sequence for Zero-Confusion
+    for ds in ["CIFAR100", "TinyImageNet"]:
+        for stage in args.stages:
+            run_experiment(dataset_name=ds, stage_id=stage)
