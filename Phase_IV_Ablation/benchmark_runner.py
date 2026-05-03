@@ -77,29 +77,34 @@ class ExternalReplayBuffer:
     """[V30] Direct (x, y) tensor buffer for Class-IL replay.
     Stores CLEAN (un-augmented) samples on CPU to avoid baking in
     one specific random crop. Augmentation applied on-the-fly during sample()."""
-    def __init__(self, per_task=1000):
+    def __init__(self, per_task=1000, img_size=32):
         self.per_task = per_task
+        self.img_size = img_size
         self.x_data = []  # list of tensors, one per stored sample
         self.y_data = []
         self._aug = transforms.Compose([
-            transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
+            transforms.RandomCrop(img_size, padding=4, padding_mode='reflect'),
             transforms.RandomHorizontalFlip(),
         ])
 
-    def update_from_loader(self, dataset, indices):
+    def update_from_loader(self, dataset, indices, dataset_name="CIFAR100"):
         """[V30.1] Store CLEAN samples by accessing the dataset with a simple transform.
         This prevents 'baked-in' augmentation drift in the replay buffer."""
         import copy
         from torch.utils.data import DataLoader, Subset
         
         # Create a temporary subset with no augmentation
-        # CIFAR-100 datasets often have the transform as an attribute
         clean_dataset = copy.copy(dataset)
         if hasattr(clean_dataset, 'transform'):
-            # Standard CIFAR-100/MNIST normalization only
+            # Match normalization to dataset
+            if dataset_name == "CIFAR100":
+                norm = transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+            else: # TinyImageNet
+                norm = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+                
             clean_dataset.transform = transforms.Compose([
                 transforms.ToTensor(),
-                transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+                norm
             ])
             
         clean_loader = DataLoader(Subset(clean_dataset, indices), batch_size=128, shuffle=False)
@@ -222,7 +227,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
 
     initial_accuracies = []
     final_accuracies = []
-    replay_buf = ExternalReplayBuffer(per_task=1000)
+    img_size = 64 if dataset_name == "TinyImageNet" else 32
+    replay_buf = ExternalReplayBuffer(per_task=1000, img_size=img_size)
 
     for t_idx in range(num_tasks):
         train_loader, _, _ = curriculum.get_task(t_idx)
@@ -233,7 +239,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         # We pass the underlying dataset and indices to avoid augmented samples
         train_indices = train_loader.dataset.indices
         base_dataset = train_loader.dataset.dataset
-        replay_buf.update_from_loader(base_dataset, train_indices)
+        replay_buf.update_from_loader(base_dataset, train_indices, dataset_name=dataset_name)
         print(f"             [REPLAY] Buffer: {len(replay_buf)} clean exemplars.")
         
         # [V29] CRITICAL: Signal end-of-task to framework.

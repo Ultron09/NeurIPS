@@ -16,8 +16,11 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
     total_step_time = 0.0
     total_steps = 0
 
-    # Dynamically detect class density (Fix for TinyImageNet/MNIST/CIFAR)
-    if hasattr(train_loader.dataset, 'classes'):
+    # [V31.7] FIX: Use model config for classes_per_task if available.
+    # Dataset.classes returns ALL classes (100 for CIFAR), which breaks task-indexing.
+    if hasattr(model, 'config') and hasattr(model.config, 'classes_per_task'):
+        classes_per_task = model.config.classes_per_task
+    elif hasattr(train_loader.dataset, 'classes') and not isinstance(train_loader.dataset, torch.utils.data.Subset):
         classes_per_task = len(train_loader.dataset.classes)
     else:
         # Fallback to 10 for standard benchmarks if detection fails
