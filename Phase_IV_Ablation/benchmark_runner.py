@@ -202,6 +202,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     
     config = get_stage_config(stage_id, dataset_name)
     model = AdaptiveFramework(model_factory(dataset_name, num_classes=num_classes), config=config).to(device)
+    # [V30.2] Inject density metadata for precise Governance
+    model.memory.total_tasks = num_tasks
+    model.memory.num_classes = num_classes
+    
     trainer = ContinualTrainer(model, device=device); evaluator = ContinualEvaluator(model, device=device)
     
     results = []
