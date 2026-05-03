@@ -7,6 +7,7 @@ import subprocess
 import time
 import traceback
 import random
+import gc
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 from torchvision.models.resnet import ResNet, BasicBlock
 from torchvision import transforms
