@@ -136,6 +136,9 @@ class ContinualTrainer:
         self.model = model; self.device = device
         self.optimizer = torch.optim.Adam(model.parameters(), lr=getattr(model.config, 'learning_rate', 5e-4))
     def train_task(self, loader, t_idx, epochs=10, replay_buffer=None):
+        # [V30.9] Optimizer Reset: Clear momentum buffers for the new task
+        # This prevents 'Velocity Drift' from previous tasks pushing against current anchors.
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=getattr(self.model.config, 'learning_rate', 5e-4))
         return train_single_task(self.model, loader, loader, self.optimizer, t_idx, device=self.device, epochs=epochs, replay_buffer=replay_buffer)
 
 class ContinualEvaluator:
@@ -219,7 +222,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     for t_idx in range(num_tasks):
         train_loader, _, _ = curriculum.get_task(t_idx)
         test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
-        trainer.train_task(train_loader, t_idx, epochs=15, replay_buffer=replay_buf if t_idx > 0 else None)
+        trainer.train_task(train_loader, t_idx, epochs=10, replay_buffer=replay_buf if t_idx > 0 else None)
         
         # [V30.1] Store CLEAN exemplars BEFORE consolidation
         # We pass the underlying dataset and indices to avoid augmented samples
