@@ -85,18 +85,37 @@ class ExternalReplayBuffer:
             transforms.RandomHorizontalFlip(),
         ])
 
-    def update_from_loader(self, loader):
-        """Store random subset of a task's data after training completes.
-        Uses the loader to extract data but stores the raw tensors."""
+    def update_from_loader(self, dataset, indices):
+        """[V30.1] Store CLEAN samples by accessing the dataset with a simple transform.
+        This prevents 'baked-in' augmentation drift in the replay buffer."""
+        import copy
+        from torch.utils.data import DataLoader, Subset
+        
+        # Create a temporary subset with no augmentation
+        # CIFAR-100 datasets often have the transform as an attribute
+        clean_dataset = copy.copy(dataset)
+        if hasattr(clean_dataset, 'transform'):
+            # Standard CIFAR-100/MNIST normalization only
+            clean_dataset.transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+            ])
+            
+        clean_loader = DataLoader(Subset(clean_dataset, indices), batch_size=128, shuffle=False)
+        
         all_x, all_y = [], []
-        for x, y in loader:
+        for x, y in clean_loader:
             all_x.append(x.cpu())
             all_y.append(y.cpu())
+            
+        if not all_x: return
+        
         all_x = torch.cat(all_x)
         all_y = torch.cat(all_y)
-        indices = torch.randperm(len(all_x))[:self.per_task]
-        self.x_data.append(all_x[indices])
-        self.y_data.append(all_y[indices])
+        
+        sel_idx = torch.randperm(len(all_x))[:self.per_task]
+        self.x_data.append(all_x[sel_idx])
+        self.y_data.append(all_y[sel_idx])
 
     def __len__(self):
         return sum(x.size(0) for x in self.x_data)
@@ -198,17 +217,18 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
         trainer.train_task(train_loader, t_idx, epochs=15, replay_buffer=replay_buf if t_idx > 0 else None)
         
-        # Store exemplars for future replay BEFORE consolidation
-        replay_buf.update_from_loader(train_loader)
-        print(f"             [REPLAY] Buffer: {len(replay_buf)} exemplars from {t_idx + 1} tasks.")
+        # [V30.1] Store CLEAN exemplars BEFORE consolidation
+        # We pass the underlying dataset and indices to avoid augmented samples
+        train_indices = train_loader.dataset.indices
+        base_dataset = train_loader.dataset.dataset
+        replay_buf.update_from_loader(base_dataset, train_indices)
+        print(f"             [REPLAY] Buffer: {len(replay_buf)} clean exemplars.")
         
         # [V29] CRITICAL: Signal end-of-task to framework.
-        # This finalizes SI importance, builds Iron Mind sacred mask,
-        # and populates the restoration cache. Without this, the framework
-        # has NO knowledge of what to protect.
-        if hasattr(model, 'consolidate_memory'):
-            model.consolidate_memory()
-            print(f"             [CONSOLIDATE] Task {t_idx} knowledge locked.")
+        # This triggers KnowledgeGovernor (Iron Mind) to lock Task N knowledge.
+        if hasattr(model, 'on_task_complete'):
+            model.on_task_complete(t_idx)
+            print(f"             [IRON_MIND] Task {t_idx} knowledge anchored.")
         
         # Capture Task Accuracies
         task_accuracies = [evaluator.evaluate(loader, i) for i, loader in enumerate(test_loaders)]
