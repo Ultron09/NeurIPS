@@ -136,8 +136,12 @@ class ContinualTrainer:
         self.model = model; self.device = device
         self.optimizer = torch.optim.Adam(model.parameters(), lr=getattr(model.config, 'learning_rate', 5e-4))
     def train_task(self, loader, t_idx, epochs=10, replay_buffer=None):
-        # [V30.9] Optimizer Reset: Clear momentum buffers for the new task
-        # This prevents 'Velocity Drift' from previous tasks pushing against current anchors.
+        # [V31.1] Explicitly purge old optimizer to free 4GB+ of momentum buffers
+        if hasattr(self, 'optimizer'):
+            del self.optimizer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=getattr(self.model.config, 'learning_rate', 5e-4))
         return train_single_task(self.model, loader, loader, self.optimizer, t_idx, device=self.device, epochs=epochs, replay_buffer=replay_buffer)
 
