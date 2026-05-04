@@ -187,7 +187,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
     if stage_id == 4: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, enable_dreaming=True, dream_interval=5)
     if stage_id == 5: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_dreaming=True, dream_interval=5)
     if stage_id == 6: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, enable_dreaming=True, dream_interval=5)
-    if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=2.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, iron_mind_quota=0.35, enable_dreaming=True, dream_interval=5)
+    if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=2.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, iron_mind_quota=0.35, enable_dreaming=True, dream_interval=20)
     return AdaptiveFrameworkConfig(**base_params)
 
 def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
