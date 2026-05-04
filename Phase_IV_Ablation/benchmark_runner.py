@@ -210,8 +210,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True  # Auto-tune convolutions for fixed input sizes
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     data_path = os.path.join(root_path, "data")
@@ -349,15 +349,25 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         print(f"             [REPLAY] Buffer: {len(replay_buf)} clean exemplars.")
         
         # [V29] CRITICAL: Signal end-of-task to framework.
-        # This triggers our patched update_sacred_mask (Iron Soul) automatically.
+        # on_task_complete populates omega/fisher values via consolidation.
         if hasattr(model, 'on_task_complete'):
+            # Temporarily restore original governor so on_task_complete doesn't crash
+            # (the package's internal call runs before omega is ready anyway)
+            original_update = model.governor.update_sacred_mask
+            model.governor.update_sacred_mask = lambda *a, **kw: None  # No-op during package consolidation
             model.on_task_complete(t_idx)
+            model.governor.update_sacred_mask = original_update  # Restore V18
+            
             # Re-sync SI anchor to prevent drift after consolidation
             with torch.no_grad():
                 for m_tracked in model.memory.models:
                     for name, p in m_tracked.named_parameters():
                         if p.requires_grad: model.memory.anchor[name] = p.data.clone().detach().cpu()
+            
+            # NOW run V18 anchoring — omega/fisher are fully populated
+            _v18_governor_patch(model.memory, t_idx, model.memory.models[0])
             print(f"             [IRON_MIND] Task {t_idx} knowledge anchored via V18 patch.")
+
         
         # Capture Task Accuracies
         task_accuracies = [evaluator.evaluate(loader, i) for i, loader in enumerate(test_loaders)]
@@ -401,14 +411,13 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--stages", type=int, nargs="+", required=True)
+    parser.add_argument("--datasets", type=str, nargs="+", default=["CIFAR100", "TinyImageNet"])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 10, 20, 30])
     args = parser.parse_args()
     
-    SEEDS = [42, 10, 20, 30]
-    DATASETS = ["CIFAR100", "TinyImageNet"]
-    
     for stage in args.stages:
-        for seed in SEEDS:
-            for ds in DATASETS:
+        for ds in args.datasets:
+            for seed in args.seeds:
                 try:
                     run_experiment(dataset_name=ds, stage_id=stage, seed=seed)
                 except Exception as e:
