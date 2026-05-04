@@ -86,6 +86,8 @@ class ExternalReplayBuffer:
             transforms.RandomCrop(img_size, padding=4, padding_mode='reflect'),
             transforms.RandomHorizontalFlip(),
         ])
+        self._cache_x = None
+        self._cache_y = None
 
     def update_from_loader(self, dataset, indices, dataset_name="CIFAR100"):
         """[V30.1] Store CLEAN samples by accessing the dataset with a simple transform.
@@ -122,19 +124,22 @@ class ExternalReplayBuffer:
         sel_idx = torch.randperm(len(all_x))[:self.per_task]
         self.x_data.append(all_x[sel_idx])
         self.y_data.append(all_y[sel_idx])
+        self._cache_x = None # Invalidate cache
+        self._cache_y = None
 
     def __len__(self):
         return sum(x.size(0) for x in self.x_data)
 
     def sample(self, batch_size):
         """Random sample across all stored tasks with on-the-fly augmentation."""
-        all_x = torch.cat(self.x_data)
-        all_y = torch.cat(self.y_data)
-        indices = torch.randperm(len(all_x))[:batch_size]
-        batch_x = all_x[indices]
-        # Apply augmentation on-the-fly for diversity
+        if self._cache_x is None:
+            self._cache_x = torch.cat(self.x_data)
+            self._cache_y = torch.cat(self.y_data)
+        
+        indices = torch.randperm(len(self._cache_x))[:batch_size]
+        batch_x = self._cache_x[indices]
         batch_x = self._aug(batch_x)
-        return batch_x, all_y[indices]
+        return batch_x, self._cache_y[indices]
 
 
 class ContinualTrainer:
@@ -157,9 +162,9 @@ class ContinualEvaluator:
     def evaluate(self, loader, t_idx):
         self.model.eval()
         correct = 0; total = 0
-        with torch.no_grad():
+        with torch.inference_mode(): # Faster than no_grad for pure eval
             for x, y in loader:
-                x, y = x.to(self.device), y.to(self.device)
+                x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
                 logits = self.model.inference_step(x) if hasattr(self.model, 'inference_step') else self.model(x)
                 if isinstance(logits, tuple): logits = logits[0]
                 preds = torch.argmax(logits, dim=1)
