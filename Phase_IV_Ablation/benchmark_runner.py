@@ -182,7 +182,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
     if stage_id == 4: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, enable_dreaming=True, dream_interval=5)
     if stage_id == 5: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_dreaming=True, dream_interval=5)
     if stage_id == 6: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, enable_dreaming=True, dream_interval=5)
-    if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=0.8, enable_consciousness=True, use_reptile=True, enable_world_model=True, iron_mind_quota=0.25, enable_dreaming=True, dream_interval=5)
+    if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=2.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, iron_mind_quota=0.35, enable_dreaming=True, dream_interval=5)
     return AdaptiveFrameworkConfig(**base_params)
 
 def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
@@ -221,6 +221,96 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     
     trainer = ContinualTrainer(model, device=device); evaluator = ContinualEvaluator(model, device=device)
     
+    # =========================================================================
+    # [V18] IRON SOUL MONKEY-PATCH (Knowledge Anchoring)
+    # =========================================================================
+    print("             [SYSTEM] Injecting Neuro-Stability V18 IRON SOUL...")
+    import types
+    model.memory.param_id_to_mask = {}     
+    model.memory.task_omega_snapshots = {} 
+
+    def _v18_update(mem, task_id, backbone_ref):
+        PER_TASK_QUOTA = 0.08 
+        MIN_IMPORTANCE = 1e-5 
+        id_to_p = {}; id_to_imp = {}
+        with torch.no_grad():
+            for m_tracked in mem.models:
+                for name, p in m_tracked.named_parameters():
+                    if not p.requires_grad: continue
+                    p_id = id(p); id_to_p[p_id] = (name, p)
+                    curr = mem.omega.get(name, torch.zeros_like(p).cpu()).clone()
+                    if name in mem.fisher_dict: curr = curr + mem.fisher_dict[name].cpu()
+                    id_to_imp[p_id] = curr
+        if not id_to_imp: return
+        mem.task_omega_snapshots[task_id] = {pid: imp.clone() for pid, imp in id_to_imp.items()}
+        cumulative = {}
+        for tid, snap in mem.task_omega_snapshots.items():
+            flat = torch.cat([v.view(-1) for v in snap.values()])
+            n = flat.numel()
+            k = max(1, min(int((1.0 - PER_TASK_QUOTA) * n), n - 1))
+            thr = max(torch.kthvalue(flat, k).values.item(), MIN_IMPORTANCE)
+            for pid, imp in snap.items():
+                m = (imp >= thr).bool()
+                cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
+        
+        # Hard-lock FC head rows
+        fc = getattr(backbone_ref, 'fc', None)
+        if fc is not None:
+            fc_w_id = id(fc.weight)
+            if fc_w_id not in cumulative: cumulative[fc_w_id] = torch.zeros(fc.weight.shape, dtype=torch.bool)
+            for tid in mem.task_omega_snapshots:
+                s, e = tid * 10, min((tid + 1) * 10, fc.weight.shape[0])
+                cumulative[fc_w_id][s:e, :] = True
+                if fc.bias is not None:
+                    fc_b_id = id(fc.bias)
+                    if fc_b_id not in cumulative: cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool)
+                    cumulative[fc_b_id][s:e] = True
+        
+        mem.param_id_to_mask = {}
+        all_names = {}
+        for m_tracked in mem.models:
+            for name, p in m_tracked.named_parameters(): all_names[id(p)] = name
+        
+        prot = 0; tot = 0
+        for pid, mask in cumulative.items():
+            if pid not in id_to_p: continue
+            tensor = id_to_p[pid][1]
+            mem.param_id_to_mask[pid] = mask.to(tensor.device)
+            prot += mask.sum().item(); tot += mask.numel()
+            if pid in all_names: mem.sacred_mask[all_names[pid]] = mask
+        mem.saturation_level = prot / tot if tot > 0 else 0.0
+        print(f"             [SENTIENT] Sacred Mask Updated. Global Saturation: {mem.saturation_level:.2%}")
+
+    model.memory._v18_update = _v18_update
+    
+    def _make_hook(p_id, mem):
+        def hook(grad):
+            m = mem.param_id_to_mask.get(p_id)
+            if m is not None: return grad * (~m.to(grad.device))
+            return grad
+        return hook
+
+    for tracked_model in model.memory.models:
+        for p in tracked_model.parameters():
+            if p.requires_grad: p.register_hook(_make_hook(id(p), model.memory))
+
+    if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
+        def _patched_reptile(self_rep):
+            tgt = self_rep.model; cw = tgt.state_dict(); eps = self_rep.config.reptile_learning_rate
+            with torch.no_grad():
+                for name, anc in self_rep.anchor_weights.items():
+                    if name not in cw: continue
+                    fast = cw[name]
+                    if anc.is_floating_point():
+                        tv = anc + eps * (fast - anc)
+                        mask = model.memory.sacred_mask.get(name)
+                        if mask is not None: cw[name].copy_(torch.where(mask.to(fast.device), anc.to(fast.device), tv.to(fast.device)))
+                        else: cw[name].copy_(tv)
+                    else: cw[name].copy_(fast)
+            self_rep.anchor_weights = self_rep._clone_weights()
+        model.meta_controller.reptile._perform_update = types.MethodType(_patched_reptile, model.meta_controller.reptile)
+    # =========================================================================
+    
     results = []
     start_time = time.time()
     torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
@@ -246,6 +336,14 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         # This triggers KnowledgeGovernor (Iron Mind) to lock Task N knowledge.
         if hasattr(model, 'on_task_complete'):
             model.on_task_complete(t_idx)
+            # Re-sync SI anchor to prevent drift after consolidation
+            with torch.no_grad():
+                for m_tracked in model.memory.models:
+                    for name, p in m_tracked.named_parameters():
+                        if p.requires_grad: model.memory.anchor[name] = p.data.clone().detach().cpu()
+            
+            # [V18] Run absolute knowledge anchoring
+            model.memory._v18_update(model.memory, t_idx, model.memory.models[0])
             print(f"             [IRON_MIND] Task {t_idx} knowledge anchored.")
         
         # Capture Task Accuracies

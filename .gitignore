@@ -24,3 +24,4 @@ venv/
 # Telemetry
 wandb/
 tea_debug.log
+tectonic.exe
