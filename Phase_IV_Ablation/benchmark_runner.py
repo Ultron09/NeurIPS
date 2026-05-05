@@ -383,7 +383,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         print("  [IRON MIND] Reptile protection active.")
 
     # ── Training setup ─────────────────────────────────────────────────────────
-    EPOCHS     = epochs_override if epochs_override is not None else 25
+    EPOCHS     = epochs_override if epochs_override is not None else 18
     replay_buf = ExternalReplayBuffer(
         per_task=2000,
         img_size=64 if dataset_name == "TinyImageNet" else 32
