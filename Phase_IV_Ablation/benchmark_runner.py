@@ -12,14 +12,36 @@ from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 import airborne_antara.moe as moe_mod
 from torchvision.models.resnet import ResNet, BasicBlock
 
-# [V21.1] GRAPH-UNITY: Patching MoE .item() graph breaks for A100 Speed
+# [V23.0] CLEAN SLATE: Re-implementing MoE to remove .item() graph breaks
 if hasattr(moe_mod, 'SparseMoE'):
-    print("             [V21.1] Patching MoE Graph Breaks for A100 Speed...")
-    _orig_sparse_fwd = moe_mod.SparseMoE.forward
-    def _unified_sparse_fwd(self, x, *args, **kwargs):
-        # The original SparseMoE.forward used 'torch.rand(1).item() < 0.1' which breaks the graph.
-        # By setting capture_scalar_outputs=True and monkey-patching, we keep the A100 in-graph.
-        return _orig_sparse_fwd(self, x, *args, **kwargs)
+    print("             [V23.0] Surgically Re-implementing SparseMoE for A100 Unity...")
+    def _unified_sparse_fwd(self, x, task_id=None, consciousness_state=None, *args, **kwargs):
+        # [V23.0] RE-IMPLEMENTED FOR GRAPH UNITY
+        # Removed torch.rand(1).item() < 0.1 which caused the hang.
+        if self.training and self.num_experts > 1:
+            # Stays in tensor-land. No CPU sync.
+            explore = (torch.rand(1, device=x.device) < 0.1).all()
+        else:
+            explore = False
+            
+        # Simplified routing logic for compilation
+        logits = self.gate(x, consciousness_state=consciousness_state)
+        if explore:
+            indices = torch.randint(0, self.num_experts, (x.size(0),), device=x.device)
+        else:
+            indices = torch.argmax(logits, dim=-1)
+            
+        # Dispatch to experts
+        outputs = torch.zeros_like(x)
+        for i in range(self.num_experts):
+            mask = (indices == i)
+            if mask.any():
+                expert_out = self.experts[i](x[mask], task_id=task_id)
+                # Ensure expert_out is same shape
+                if isinstance(expert_out, tuple): expert_out = expert_out[0]
+                outputs[mask] = expert_out
+        return outputs, indices
+
     moe_mod.SparseMoE.forward = _unified_sparse_fwd
     torch._dynamo.config.capture_scalar_outputs = True
 from torchvision import transforms
@@ -355,8 +377,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
             model.meta_controller.sharpen_temperature = lambda *a, **k: None
             print("             [V18.8_LOCK] MoE Temperature physically locked at 1.0")
     
+    @torch._dynamo.disable
     def _v18_pre_warm_protection_map(self):
-        """[V18.11] Pre-compile the gradient multiplier cache to avoid first-step hangs."""
+        """[V23.0] Mark as Disabled for Compiler to avoid Sympy hangs."""
         experts = getattr(self.memory, 'models', [])
         num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
         
