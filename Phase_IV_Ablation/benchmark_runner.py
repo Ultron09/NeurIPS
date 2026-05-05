@@ -240,9 +240,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     trainer = ContinualTrainer(model, device=device); evaluator = ContinualEvaluator(model, device=device)
     
     # =========================================================================
-    # [V18] IRON SOUL MONKEY-PATCH (Knowledge Anchoring)
+    # [V22] ABSOLUTE ZERO PROTOCOL (Hard-Lock + Hyper-Plasticity)
     # =========================================================================
-    print("             [SYSTEM] Injecting Neuro-Stability V18 IRON SOUL...")
     import types
     model.memory.param_id_to_mask = {}     
     model.memory.task_omega_snapshots = {} 
@@ -293,18 +292,16 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
                 cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
         
         # Apply the final union mask
-        prot = 0; tot = 0
         for pid, mask in cumulative.items():
             if pid not in id_to_p: continue
             name, tensor = id_to_p[pid]
             mem.param_id_to_mask[pid] = mask.to(tensor.device)
-            prot += mask.sum().item(); tot += mask.numel()
             # Write sacred_mask with the PREFIXED key the package expects
             if pid in id_to_prefixed_name:
                 mem.sacred_mask[id_to_prefixed_name[pid]] = mask.to(tensor.device)
         
-        mem.saturation_level = prot / tot if tot > 0 else 0.0
-        print(f"             [V18_IRON_SOUL] Sacred Mask Updated. Global Saturation: {mem.saturation_level:.2%}")
+        mem.saturation_level = (sum(m.sum() for m in cumulative.values()) / sum(m.numel() for m in cumulative.values())).item()
+        print(f"             [TITAN] Hard-Lock Active. Saturation: {mem.saturation_level:.2%}")
 
     # Redirect both the governor and the internal memory update
     model.governor.update_sacred_mask = _v18_governor_patch
@@ -357,44 +354,46 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         if hasattr(model.meta_controller, 'sharpen_temperature'):
             model.meta_controller.sharpen_temperature = lambda *a, **k: None
             print("             [V18.8_LOCK] MoE Temperature physically locked at 1.0")
+    
+    def _v18_pre_warm_protection_map(self):
+        """[V18.11] Pre-compile the gradient multiplier cache to avoid first-step hangs."""
+        experts = getattr(self.memory, 'models', [])
+        num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
+        
+        print("             [V18.11] Pre-warming Speed-Optimized Protection Map...")
+        self.memory._v18_grad_multipliers = {}
+        self.memory._v18_sacred_bns = []
+        
+        with torch.no_grad():
+            for name, p in self.model.named_parameters():
+                combined_mask = torch.zeros_like(p, dtype=torch.bool)
+                found = False
+                for exp_idx in range(max(1, num_experts)):
+                    key = f"m{exp_idx}_{name}"
+                    if key in self.memory.sacred_mask:
+                        combined_mask |= self.memory.sacred_mask[key].to(p.device)
+                        found = True
+                if found:
+                    self.memory._v18_grad_multipliers[name] = torch.where(combined_mask, 0.0, 1.2).to(p.device)
+                else:
+                    self.memory._v18_grad_multipliers[name] = 1.2
+
+            for m_name, m in self.model.named_modules():
+                if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
+                    is_sacred = False
+                    for exp_idx in range(max(1, num_experts)):
+                        if f"m{exp_idx}_{m_name}.weight" in self.memory.sacred_mask:
+                            is_sacred = True; break
+                    if is_sacred: self.memory._v18_sacred_bns.append(m)
+        self.memory._v18_cache_id = len(self.memory.sacred_mask)
+
+    model.pre_warm_protection_map = types.MethodType(_v18_pre_warm_protection_map, model)
 
     _original_train_step = model.train_step
     def _v18_absolute_zero_train_step(self, x, target_data=None, **kwargs):
-        # [V18.11] SHARED METRICS
-        experts = getattr(self.memory, 'models', [])
-        num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
-
-        # 1. Lazy-init the Gradient Multiplier Cache (Only once per task)
+        # [V18.11] Re-warm only if cache is stale
         if not hasattr(self.memory, '_v18_grad_multipliers') or self.memory._v18_cache_id != len(self.memory.sacred_mask):
-            print("             [V18.11] Recompiling Speed-Optimized Protection Map...")
-            self.memory._v18_grad_multipliers = {}
-            self.memory._v18_sacred_bns = []
-            
-            with torch.no_grad():
-                # Cache Parameter Multipliers
-                for name, p in self.model.named_parameters():
-                    combined_mask = torch.zeros_like(p, dtype=torch.bool)
-                    found = False
-                    for exp_idx in range(max(1, num_experts)):
-                        key = f"m{exp_idx}_{name}"
-                        if key in self.memory.sacred_mask:
-                            combined_mask |= self.memory.sacred_mask[key].to(p.device)
-                            found = True
-                    if found:
-                        self.memory._v18_grad_multipliers[name] = torch.where(combined_mask, 0.0, 1.2).to(p.device)
-                    else:
-                        self.memory._v18_grad_multipliers[name] = 1.2
-
-                # Cache Sacred BatchNorms
-                for m_name, m in self.model.named_modules():
-                    if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
-                        is_sacred = False
-                        for exp_idx in range(max(1, num_experts)):
-                            if f"m{exp_idx}_{m_name}.weight" in self.memory.sacred_mask:
-                                is_sacred = True; break
-                        if is_sacred: self.memory._v18_sacred_bns.append(m)
-            
-            self.memory._v18_cache_id = len(self.memory.sacred_mask)
+            self.pre_warm_protection_map()
 
         # 2. Apply BN Cryostasis
         for m in self.memory._v18_sacred_bns: m.eval()
@@ -405,23 +404,25 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         # 3. FAST DUAL-RATE STEP (V20.1 STABILIZED BERSERKER)
         with torch.no_grad():
             is_plastic_task = getattr(self, 'current_task', 0) > 0
-            
-            # Step A: Global Gradient Clipping to prevent NaNs from 4.0x boost
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             
             for name, p in self.model.named_parameters():
                 if p.grad is not None and name in self.memory._v18_grad_multipliers:
                     m = self.memory._v18_grad_multipliers[name]
                     if is_plastic_task:
-                        # [V20.1] Physical Zero-Out for sacred
+                        # [V22] Absolute Zero: Hard Gradient Lock
                         sacred_mask = (m < 0.1)
                         if sacred_mask.any():
                             p.grad.data.masked_fill_(sacred_mask, 0.0)
+                            # Physical parameter restoration (Absolute Zero Protection)
+                            anchor_key = name # We assume names match or handle prefixing
+                            if anchor_key in self.memory.anchor:
+                                anc = self.memory.anchor[anchor_key].to(p.device)
+                                p.data.copy_(torch.where(sacred_mask, anc, p.data))
                         
-                        # [V20.1] 4.0x Berserker Boost for plastic
+                        # [V22] Berserker Boost
                         p.grad.data.mul_(4.0)
                     else:
-                        # Task 0 Standard
                         p.grad.data.mul_(m)
 
         for m in self.memory._v18_sacred_bns: m.train()
@@ -472,6 +473,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         train_loader.prefetch_factor = 4 
         # [V19.1] UNIFIED 8-EPOCH REGIME
         n_epochs = 8 
+        # [V21.2] PRE-WARM PROTECTION MAP: Avoid Inductor Hangs
+        model.pre_warm_protection_map()
+        
         print(f"\n[WARRIOR] Starting Task {t_idx} | Regime: {'FOUNDATION' if t_idx==0 else 'HYPER-PLASTIC'} | Epochs: {n_epochs}")
         
         # [V20.1] MOMENTUM PURGE & ROUTER ANCHORING
