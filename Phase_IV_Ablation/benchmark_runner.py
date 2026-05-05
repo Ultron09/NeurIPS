@@ -34,13 +34,18 @@ if hasattr(moe_mod, 'SparseMoE'):
             indices = torch.argmax(logits, dim=-1)
             
         # Dispatch to experts
-        outputs = torch.zeros_like(x)
+        outputs = None
         for i in range(self.num_experts):
             mask = (indices == i)
             if mask.any():
                 expert_out = self.experts[i](x[mask], task_id=task_id)
                 # Ensure expert_out is same shape
                 if isinstance(expert_out, tuple): expert_out = expert_out[0]
+                
+                if outputs is None:
+                    # Lazy init based on first expert's output shape
+                    outputs = torch.zeros(x.size(0), *expert_out.shape[1:], device=x.device, dtype=x.dtype)
+                
                 outputs[mask] = expert_out
         return outputs, indices
 
