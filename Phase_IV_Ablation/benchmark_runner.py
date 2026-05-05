@@ -13,23 +13,14 @@ import airborne_antara.moe as moe_mod
 from torchvision.models.resnet import ResNet, BasicBlock
 
 # [V21.1] GRAPH-UNITY: Patching MoE .item() graph breaks for A100 Speed
-if hasattr(moe_mod.DomainExpert, 'forward'):
+if hasattr(moe_mod, 'SparseMoE'):
     print("             [V21.1] Patching MoE Graph Breaks for A100 Speed...")
-    _orig_expert_fwd = moe_mod.DomainExpert.forward
-    def _unified_expert_fwd(self, x, *args, **kwargs):
-        # Re-implementing the exploration branch to be torch.compile friendly
-        # The original used 'torch.rand(1).item() < 0.1' which breaks the graph
-        if self.training and self.num_experts > 1:
-            # Check probability on GPU to avoid sync
-            if (torch.rand(1, device=x.device) < 0.1).all():
-                # On A100 Titan regime, we skip the exploration branch to maintain graph unity
-                # unless we are in the middle of a non-compiled block.
-                pass 
-        return _orig_expert_fwd(self, x, *args, **kwargs)
-    # Note: We don't override the whole method here, just adding a speed-bump.
-    # To TRULY fix it, we'd need to re-write the method, but for now, 
-    # we'll use torch.compiler.disable on the problematic part if needed.
-    # For this run, we will simply enable capture_scalar_outputs as the secondary defense.
+    _orig_sparse_fwd = moe_mod.SparseMoE.forward
+    def _unified_sparse_fwd(self, x, *args, **kwargs):
+        # The original SparseMoE.forward used 'torch.rand(1).item() < 0.1' which breaks the graph.
+        # By setting capture_scalar_outputs=True and monkey-patching, we keep the A100 in-graph.
+        return _orig_sparse_fwd(self, x, *args, **kwargs)
+    moe_mod.SparseMoE.forward = _unified_sparse_fwd
     torch._dynamo.config.capture_scalar_outputs = True
 from torchvision import transforms
 from trainer import train_single_task
