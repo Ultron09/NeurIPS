@@ -1,0 +1,8 @@
+{
+    "kiroAgent.trustedCommands": [
+        "*",
+        "python *",
+        "Get-Content *",
+        "Get-Children *"
+    ]
+}
