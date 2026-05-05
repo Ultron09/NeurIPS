@@ -187,7 +187,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
     if stage_id == 4: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, enable_dreaming=True, dream_interval=5)
     if stage_id == 5: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_dreaming=True, dream_interval=5)
     if stage_id == 6: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, enable_dreaming=True, dream_interval=5)
-    if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=2.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, iron_mind_quota=0.35, enable_dreaming=True, dream_interval=20)
+    if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=2.5, enable_consciousness=False, use_reptile=True, iron_mind_quota=0.35,use_learned_optimizer=False)
     return AdaptiveFrameworkConfig(**base_params)
 
 def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
@@ -389,11 +389,21 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         # Step: Forward & Backward
         res = _original_train_step(x, target_data=target_data, **kwargs)
         
-        # 3. Fast Gradient Protection Step
+        # 3. FAST DUAL-RATE STEP
         with torch.no_grad():
+            # [V19] Hyper-Boost Detection
+            is_plastic_task = getattr(self, 'current_task', 0) > 0
+            plastic_multiplier = 2.5 if is_plastic_task else 1.2
+            
             for name, p in self.model.named_parameters():
                 if p.grad is not None and name in self.memory._v18_grad_multipliers:
-                    p.grad.data.mul_(self.memory._v18_grad_multipliers[name])
+                    # Apply pre-compiled multiplier (which includes the 0.0 lock)
+                    # If it's a plastic task, we scale the 1.2 part up to 2.5
+                    m = self.memory._v18_grad_multipliers[name]
+                    if is_plastic_task:
+                        # Convert 1.2 elements to 2.5, keep 0.0 as 0.0
+                        m = torch.where(m > 0.1, 2.5, 0.0).to(p.device)
+                    p.grad.data.mul_(m)
 
         for m in self.memory._v18_sacred_bns: m.train()
         return res
@@ -434,13 +444,23 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         train_loader, _, _ = curriculum.get_task(t_idx)
         # [V18.7] SPEED: Task 0 needs 10 epochs for foundation, others can thrive on 7
         n_epochs = 10 if t_idx == 0 else 7
-        
         # Optimize DataLoader for speed
         train_loader.num_workers = 4
         train_loader.pin_memory = True
         train_loader.prefetch_factor = 2 # Fix TypeError in newer PyTorch/Python versions
+        # [V19.1] UNIFIED 8-EPOCH REGIME
+        n_epochs = 8 
+        print(f"\n[WARRIOR] Starting Task {t_idx} | Regime: {'FOUNDATION' if t_idx==0 else 'HYPER-PLASTIC'} | Epochs: {n_epochs}")
         
-        test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
+        # [V19] AUTONOMIC DRIVE: Disable high-overhead features for Tasks 1-9
+        if t_idx > 0:
+            original_train_single = trainer.train_task
+            def _v19_autonomic_train(loader, task_id, epochs, replay_buffer=None):
+                return train_single_task(trainer.model, loader, loader, trainer.optimizer, task_id, 
+                                       device=trainer.device, epochs=epochs, replay_buffer=replay_buffer,
+                                       enable_dream=False, meta_step=False) # FAST MODE
+            trainer.train_task = _v19_autonomic_train
+
         trainer.train_task(train_loader, t_idx, epochs=n_epochs, replay_buffer=replay_buf if t_idx > 0 else None)
         
         # [V30.1] Store CLEAN exemplars BEFORE consolidation
