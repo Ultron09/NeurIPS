@@ -443,11 +443,13 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
 
     initial_accuracies = []
     final_accuracies = []
+    test_loaders = []
     img_size = 64 if dataset_name == "TinyImageNet" else 32
     replay_buf = ExternalReplayBuffer(per_task=1000, img_size=img_size)
 
     for t_idx in range(num_tasks):
-        train_loader, _, _ = curriculum.get_task(t_idx)
+        train_loader, _, test_loader = curriculum.get_task(t_idx)
+        test_loaders.append(test_loader)
         # [V18.7] SPEED: Task 0 needs 10 epochs for foundation, others can thrive on 7
         n_epochs = 10 if t_idx == 0 else 7
         # Optimize DataLoader for speed
