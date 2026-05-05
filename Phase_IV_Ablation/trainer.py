@@ -146,6 +146,7 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                         optimizer.step()
                         if scheduler is not None:
                             scheduler.step()
+                        step_loss = loss
 
                         if agem_module: agem_module.buffer.update(x, y)
                         if replay_buffer:
@@ -153,8 +154,8 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                                 replay_buffer.update(x, y)
                         if der_module: der_module.update(x, y, logits.detach())
 
-                    total_loss += step_loss.item() if torch.is_tensor(step_loss) else step_loss
-                    total_steps += 1
+                total_loss += step_loss.item() if torch.is_tensor(step_loss) else step_loss
+                total_steps += 1
             
             avg_epoch_loss = total_loss / total_steps if total_steps > 0 else 0
             print(f"\n             [DEBUG] Task {t_idx} Epoch {epoch} completed. Avg Loss: {avg_epoch_loss:.4f}", flush=True)
