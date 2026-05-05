@@ -235,10 +235,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     model.memory.task_omega_snapshots = {} 
 
     def _v18_governor_patch(mem, task_id, backbone_ref):
-        # [V18.5] FLUID SOUL: Dynamically calculate quota from framework state
-        total_quota = getattr(mem.config, 'iron_mind_quota', 0.35)
-        num_tasks = getattr(mem, 'total_tasks', 10)
+        # [V18.5] FLUID SOUL: Dynamically calculate quota from the local experiment scope
+        total_quota = getattr(config, 'iron_mind_quota', 0.35)
         # Use 8% if possible, but stay within the global limit per task
+        # num_tasks is available from line 218/219
         PER_TASK_QUOTA = min(0.08, total_quota / max(1, num_tasks))
         
         MIN_IMPORTANCE = 1e-5 
