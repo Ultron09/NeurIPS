@@ -366,17 +366,28 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
             # Step 1: Forward & Backward
             res = _original_train_step(x, target_data=target_data, **kwargs)
             
-            # Step 2: PHYSICAL GRADIENT DELETION (The Shunt)
-            # This makes it impossible for the optimizer to update sacred weights.
+            # Step 2: DUAL-RATE GRADIENT ENGINE (Lock + Boost)
+            # Sacred = 0.0x (Lock) | Non-Sacred = 1.2x (Plasticity Boost)
             if hasattr(self.memory, 'sacred_mask'):
                 for name, p in self.model.named_parameters():
-                    # Expert-aware key check
+                    if p.grad is None: continue
+                    
+                    # Create a master mask for this parameter across all experts
+                    is_p_sacred = False
+                    combined_mask = torch.zeros_like(p.grad, dtype=torch.bool)
                     for exp_idx in range(max(1, num_experts)):
                         key = f"m{exp_idx}_{name}"
                         if key in self.memory.sacred_mask:
-                            mask = self.memory.sacred_mask[key]
-                            if p.grad is not None:
-                                p.grad.data.mul_( (~mask).to(p.grad.dtype).to(p.grad.device) )
+                            combined_mask |= self.memory.sacred_mask[key].to(p.device)
+                            is_p_sacred = True
+                    
+                    if is_p_sacred:
+                        # [V18.9] 0.0x for sacred, 1.2x for plastic
+                        multiplier = torch.where(combined_mask, 0.0, 1.2)
+                        p.grad.data.mul_(multiplier.to(p.grad.dtype))
+                    else:
+                        # Entire parameter is plastic
+                        p.grad.data.mul_(1.2)
 
             # Post-step BN restore
             for m in sacred_modules: m.train()
@@ -388,7 +399,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
 
     if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
         def _patched_reptile(self_rep):
-            tgt = self_rep.model; cw = tgt.state_dict(); eps = self_rep.config.reptile_learning_rate
+            # [V18.9] Meta-Learning Acceleration: Boost meta-update for plasticity
+            tgt = self_rep.model; cw = tgt.state_dict(); eps = self_rep.config.reptile_learning_rate * 1.5
             with torch.no_grad():
                 for name, anc in self_rep.anchor_weights.items():
                     if name not in cw: continue
