@@ -235,21 +235,27 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     model.memory.task_omega_snapshots = {} 
 
     def _v18_governor_patch(mem, task_id, backbone_ref):
-        """V18 IRON SOUL: Replaces the broken package governor logic."""
+        """V18 IRON SOUL: Device-safe sacred mask with correct m{idx}_ key prefix."""
         PER_TASK_QUOTA = 0.08 
         MIN_IMPORTANCE = 1e-5 
         id_to_p = {}; id_to_imp = {}
-        all_names = {id(p): n for n, p in backbone_ref.named_parameters()}
+        id_to_prefixed_name = {}
         
         with torch.no_grad():
-            for m_tracked in mem.models:
+            for m_idx, m_tracked in enumerate(mem.models):
+                prefix = f"m{m_idx}_"
                 for name, p in m_tracked.named_parameters():
                     if not p.requires_grad: continue
-                    p_id = id(p); id_to_p[p_id] = (name, p)
-                    # Pull Fisher/Omega importance (Ensure CPU for bitwise ops)
-                    curr = mem.omega.get(name, torch.zeros_like(p).cpu()).clone().cpu()
-                    if hasattr(mem, 'fisher_dict') and name in mem.fisher_dict:
-                        curr = curr + mem.fisher_dict[name].clone().cpu()
+                    p_id = id(p)
+                    id_to_p[p_id] = (name, p)
+                    
+                    # Use the CORRECT prefixed key for omega/fisher lookup
+                    omega_key = prefix + name
+                    id_to_prefixed_name[p_id] = omega_key
+                    
+                    curr = mem.omega.get(omega_key, torch.zeros_like(p).cpu()).clone().cpu()
+                    if hasattr(mem, 'fisher_dict') and omega_key in mem.fisher_dict:
+                        curr = curr + mem.fisher_dict[omega_key].clone().cpu()
                     id_to_imp[p_id] = curr
         
         if not id_to_imp: return
@@ -258,29 +264,13 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         # Recalculate Union of top-8% across all tasks seen so far
         cumulative = {}
         for tid, snap in mem.task_omega_snapshots.items():
-            # Standardize device to CPU for the OR operation
             flat = torch.cat([v.view(-1) for v in snap.values()])
             n = flat.numel()
             k = max(1, min(int((1.0 - PER_TASK_QUOTA) * n), n - 1))
             thr = max(torch.kthvalue(flat, k).values.item(), MIN_IMPORTANCE)
             for pid, imp in snap.items():
-                m = (imp >= thr).bool().cpu() # Force CPU
+                m = (imp >= thr).bool().cpu()
                 cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
-
-        # Hard-lock FC head rows for previous tasks
-        fc = getattr(backbone_ref, 'fc', None)
-        if fc is not None:
-            fc_w_id = id(fc.weight)
-            if fc_w_id not in cumulative: 
-                cumulative[fc_w_id] = torch.zeros(fc.weight.shape, dtype=torch.bool)
-            for tid in mem.task_omega_snapshots:
-                s, e = tid * 10, min((tid + 1) * 10, fc.weight.shape[0])
-                cumulative[fc_w_id][s:e, :] = True
-                if fc.bias is not None:
-                    fc_b_id = id(fc.bias)
-                    if fc_b_id not in cumulative: 
-                        cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool)
-                    cumulative[fc_b_id][s:e] = True
         
         # Apply the final union mask
         prot = 0; tot = 0
@@ -289,8 +279,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
             name, tensor = id_to_p[pid]
             mem.param_id_to_mask[pid] = mask.to(tensor.device)
             prot += mask.sum().item(); tot += mask.numel()
-            if pid in all_names: 
-                mem.sacred_mask[all_names[pid]] = mask.to(tensor.device)
+            # Write sacred_mask with the PREFIXED key the package expects
+            if pid in id_to_prefixed_name:
+                mem.sacred_mask[id_to_prefixed_name[pid]] = mask.to(tensor.device)
         
         mem.saturation_level = prot / tot if tot > 0 else 0.0
         print(f"             [V18_IRON_SOUL] Sacred Mask Updated. Global Saturation: {mem.saturation_level:.2%}")
@@ -298,6 +289,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     # Redirect both the governor and the internal memory update
     model.governor.update_sacred_mask = _v18_governor_patch
     model.memory._v18_update = _v18_governor_patch
+
     
     def _make_hook(p_id, mem):
         def hook(grad):
