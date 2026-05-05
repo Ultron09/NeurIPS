@@ -503,8 +503,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # during backward, so we don't need pre-backward hooks here.
         if is_plastic:
             with torch.no_grad():
-                # [DIAGNOSTIC] Check for label space mismatch periodically during training
-                if random.random() < 0.005:
+                # [DIAGNOSTIC] Check for label space mismatch periodically during training (10% freq)
+                if random.random() < 0.1:
                     test_logits = self.inference_step(x[:8], task_id=None)
                     if isinstance(test_logits, tuple): test_logits = test_logits[0]
                     test_preds = test_logits.argmax(dim=1)
@@ -518,9 +518,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                             anc.to(p.device),
                             p.data
                         ))
-                    # [TELEMETRY] MoE usage
-                    if random.random() < 0.01:
-                        print(f"             [MOE DEBUG] Active experts usage logged.", flush=True)
 
         for m in self.memory._v18_sacred_bns:
             m.train()
