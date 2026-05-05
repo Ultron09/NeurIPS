@@ -308,6 +308,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
     return AdaptiveFrameworkConfig(**base_params)
 
 def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override=None):
+    import types
     node_name = socket.gethostname()
     res_dir = os.path.join(os.getcwd(), "results"); os.makedirs(res_dir, exist_ok=True)
     filename = f"SeqN_{node_name}_{seed}_{dataset_name}_{stage_id}.txt"
