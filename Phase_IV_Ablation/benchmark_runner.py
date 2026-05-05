@@ -267,13 +267,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     else: curriculum = SplitTinyImageNet(root=data_path, batch_size=256); num_classes = 200; num_tasks = 10
     
     config = get_stage_config(stage_id, dataset_name)
-    model = AdaptiveFramework(model_factory(dataset_name, num_classes=num_classes), config=config).to(device)
+    # [V24.6] UNIFIED KERNEL: Disable internal compile to avoid nested JIT hangs
+    if hasattr(config, 'use_compile'): config.use_compile = False
     
-    # [V24.3] TITAN PRE-HEAT: Forcing CUDA Graph Warmup
-    print("             [TITAN] Pre-heating Cognitive Kernels (CUDA Graphs)...")
-    torch._dynamo.config.optimize_ddp = False 
-    # mode="reduce-overhead" uses CUDA Graphs for maximum A100 throughput
-    model = torch.compile(model, mode="reduce-overhead")
+    model = AdaptiveFramework(model_factory(dataset_name, num_classes=num_classes), config=config).to(device)
     
     # Run a dummy pass to trigger JIT compilation before the loop
     with torch.amp.autocast('cuda'):
@@ -492,6 +489,11 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
             self_rep.anchor_weights = self_rep._clone_weights()
         model.meta_controller.reptile._perform_update = types.MethodType(_patched_reptile, model.meta_controller.reptile)
     # =========================================================================
+
+    # [V24.6] UNIFIED KERNEL: Single final compilation pass for A100
+    print("             [TITAN] Pre-heating Unified Cognitive Kernel (max-autotune)...")
+    torch._dynamo.config.optimize_ddp = False 
+    model = torch.compile(model, mode="max-autotune")
 
     
     results = []
