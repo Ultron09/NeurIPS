@@ -37,19 +37,26 @@ if hasattr(moe_mod, 'SparseMoE'):
                 if isinstance(test_out, tuple): test_out = test_out[0]
                 self._v24_out_dim = test_out.shape[1]
         
-        outputs = torch.zeros(x.size(0), self._v24_out_dim, device=x.device, dtype=x.dtype)
+        outputs = None
         for i in range(self.num_experts):
             mask = (indices == i)
-            # We use a small epsilon to keep the graph static if needed, 
-            # but mask indexing is generally okay if indices is a tensor.
             expert_out = self.experts[i](x[mask], task_id=task_id)
             if isinstance(expert_out, tuple): expert_out = expert_out[0]
+            
+            if outputs is None:
+                # [V24.2] Precision-Sync: Use expert_out.dtype (Half/Float) to avoid Index put mismatch
+                outputs = torch.zeros(x.size(0), self._v24_out_dim, device=x.device, dtype=expert_out.dtype)
+            
             outputs[mask] = expert_out
             
         return outputs, indices
 
     moe_mod.SparseMoE.forward = _unified_sparse_fwd
     torch._dynamo.config.capture_scalar_outputs = True
+    # [V24.1] TITAN STABILIZERS: Push past recompile limits
+    torch._dynamo.config.allow_unspec_int_on_nn_module = True
+    torch._dynamo.config.recompile_limit = 64
+    torch._dynamo.config.suppress_errors = True
 from torchvision import transforms
 from trainer import train_single_task
 
