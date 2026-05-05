@@ -292,28 +292,26 @@ def get_stage_config(stage_id: int, dataset_name: str):
             use_moe=True,
             # [NeurIPS] Flat MoE — hierarchical creates too many backbone copies
             use_hierarchical_moe=False,
-            # [NeurIPS] SI lambda: 800 is the package's tuned default for CIFAR-100
-            si_lambda=800.0,
+            # [NeurIPS] SI lambda tuned for class-IL on A100.
+            # 800 was too strong — it prevented task 1+ from building competitive
+            # logits in their FC rows, causing 0% accuracy on all tasks after task 0.
+            # 50 gives enough regularization for BWT~0 without crushing plasticity.
+            si_lambda=50.0,
             ewc_lambda=0.0,
-            # [NeurIPS] SI-only: EWC Fisher on 118M params is too slow on CPU.
-            # SI path-integral alone is sufficient for BWT >= 0.
-            # Switch to 'hybrid' on A100 where Fisher computation is fast.
             memory_type='si',
-            # [NeurIPS] OGD disabled on 5060 (subspace SVD on 118M params is slow).
-            # Enable on A100: use_ogd=True, ogd_max_basis_size=256
             use_ogd=False,
             ogd_max_basis_size=256,
             novelty_z_threshold=1.2,
             adaptation_threshold=0.05,
             enable_consciousness=True,
-            use_reptile=True,
+            use_reptile=False,   # Reptile disabled: it overwrites sacred weights via slow_weights
             reptile_learning_rate=0.1,
             # [NeurIPS] 8% per task — matches APR claim in abstract exactly
             iron_mind_quota=0.08,
             use_elastic_quota=False,
             use_learned_optimizer=False,
-            enable_world_model=True,
-            world_model_loss_weight=0.1,
+            enable_world_model=False,   # World model disabled: adds noise without benefit at this stage
+            world_model_loss_weight=0.0,
             # External replay buffer handles this — disable internal dreaming
             enable_dreaming=False,
             dream_batch_size=0,
@@ -347,10 +345,23 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     
     # [V22] PATCHES
     model.memory.param_id_to_mask = {}; model.memory.task_omega_snapshots = {}
-    # [NeurIPS] accumulate_importance is called by the dream loop but doesn't exist
-    # in memory.py — alias it to accumulate_path so SI accumulates during dreaming too
+    # accumulate_importance is called by the dream loop but doesn't exist in memory.py
     if not hasattr(model.memory, 'accumulate_importance'):
-        model.memory.accumulate_importance = model.memory.accumulate_path 
+        model.memory.accumulate_importance = model.memory.accumulate_path
+
+    # [CRITICAL] Disable the package's _apply_sacred_restoration.
+    # It uses memory.anchor which has near-zero values for unseen task FC rows.
+    # Every optimizer step it would snap rows 10-19 back to near-zero during task 1.
+    # Our own post-step restoration in _v18_absolute_zero_train_step is task-aware
+    # and handles this correctly.
+    model._apply_sacred_restoration = lambda: None
+
+    # [CRITICAL] Disable lookahead — it copies slow_weights back into the model
+    # after every k steps. slow_weights were captured at task 0 end, so they have
+    # near-zero values for rows 10-99. This would overwrite task 1's learned FC rows.
+    model.config.use_lookahead = False
+    if hasattr(model, 'slow_weights'):
+        del model.slow_weights
 
     def _v18_governor_patch(mem, task_id, backbone_ref):
         """
@@ -634,24 +645,29 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer, mode='FINAL')
 
         print("             [DEBUG] Memory consolidated. Anchoring Parameters...", flush=True)
-        # [V25.12] Manual Anchoring — use prefixed keys matching memory.py's format
-        # memory.py uses "m{idx}_{name}" keys throughout (omega, sacred_mask, anchor)
-        # _rebuild_restoration_cache and _apply_sacred_restoration both expect this format
+        # Update anchors with current parameter values using prefixed keys.
+        # This is done AFTER consolidate() so our values take precedence.
+        # For FC rows: we store the current trained values for ALL rows,
+        # so future restoration uses the correct anchor for each task's rows.
         with torch.no_grad():
             for m_idx, m_tr in enumerate(model.memory.models):
                 for n, p in m_tr.named_parameters():
                     if p.requires_grad:
                         unique_name = f"m{m_idx}_{n}"
+                        # Store on same device as parameter (not CPU) so
+                        # pre_warm_protection_map can use it directly
                         model.memory.anchor[unique_name] = p.data.clone().detach()
         
         print("             [DEBUG] Parameters Anchored. Patching Governor...", flush=True)
         _v18_governor_patch(model.memory, t_idx, model.memory.models[0])
 
         print("             [DEBUG] Governor Patched. Rebuilding restoration cache...", flush=True)
-        # Rebuild the package's internal sacred param cache so _apply_sacred_restoration works
+        # Rebuild the package's internal sacred param cache
         model._rebuild_restoration_cache()
         # Re-install CAS gradient shunts with the updated mask
         model.apply_cas_protection()
+        # Re-disable _apply_sacred_restoration after apply_cas_protection may have reset it
+        model._apply_sacred_restoration = lambda: None
 
         print("             [DEBUG] Restoration cache rebuilt. Evaluating Performance...", flush=True)
         task_accs = []
