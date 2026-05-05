@@ -335,66 +335,59 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
                 print(f"             [V18.4_STABILITY] MoE Temperature stabilized at {self.meta_controller.temp:.4f}")
         model.on_task_complete = types.MethodType(_v18_eternal_on_task, model)
 
-    # [V18.8] ABSOLUTE ZERO: Physical Gradient Shunt + Temperature Lock
-    from torch.cuda.amp import autocast, GradScaler
-    model.scaler = GradScaler()
+    # [V18.9.2] CLEAN SINGULARITY: Dual-Rate Gradient Engine
+    # We remove the manual scaler to avoid conflict with the framework's native AMP.
     
     # 1. Freeze Router Temperature at 1.0 (Neutral/Stable)
     if hasattr(model, 'meta_controller'):
         model.meta_controller.temp = 1.0
-        # Patch the temperature sharpen method to DO NOTHING
         if hasattr(model.meta_controller, 'sharpen_temperature'):
             model.meta_controller.sharpen_temperature = lambda *a, **k: None
             print("             [V18.8_LOCK] MoE Temperature physically locked at 1.0")
 
     _original_train_step = model.train_step
     def _v18_absolute_zero_train_step(self, x, target_data=None, **kwargs):
-        with autocast():
-            # Apply BN Cryostasis
-            sacred_modules = []
-            if hasattr(self.memory, 'sacred_mask'):
-                experts = getattr(self.memory, 'models', [])
-                num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
-                for m_name, m in self.model.named_modules():
-                    if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
-                        is_sacred = False
-                        for exp_idx in range(max(1, num_experts)):
-                            if f"m{exp_idx}_{m_name}.weight" in self.memory.sacred_mask:
-                                is_sacred = True; break
-                        if is_sacred: m.eval(); sacred_modules.append(m)
-            
-            # Step 1: Forward & Backward
-            res = _original_train_step(x, target_data=target_data, **kwargs)
-            
-            # Step 2: DUAL-RATE GRADIENT ENGINE (Lock + Boost)
-            # Sacred = 0.0x (Lock) | Non-Sacred = 1.2x (Plasticity Boost)
-            if hasattr(self.memory, 'sacred_mask'):
-                for name, p in self.model.named_parameters():
-                    if p.grad is None: continue
-                    
-                    # Create a master mask for this parameter across all experts
-                    is_p_sacred = False
-                    combined_mask = torch.zeros_like(p.grad, dtype=torch.bool)
+        # [V18.3] ZENITH BN CRYOSTASIS
+        sacred_modules = []
+        if hasattr(self.memory, 'sacred_mask'):
+            experts = getattr(self.memory, 'models', [])
+            num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
+            for m_name, m in self.model.named_modules():
+                if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
+                    is_sacred = False
                     for exp_idx in range(max(1, num_experts)):
-                        key = f"m{exp_idx}_{name}"
-                        if key in self.memory.sacred_mask:
-                            combined_mask |= self.memory.sacred_mask[key].to(p.device)
-                            is_p_sacred = True
-                    
-                    if is_p_sacred:
-                        # [V18.9] 0.0x for sacred, 1.2x for plastic
-                        multiplier = torch.where(combined_mask, 0.0, 1.2)
-                        p.grad.data.mul_(multiplier.to(p.grad.dtype))
-                    else:
-                        # Entire parameter is plastic
-                        p.grad.data.mul_(1.2)
+                        if f"m{exp_idx}_{m_name}.weight" in self.memory.sacred_mask:
+                            is_sacred = True; break
+                    if is_sacred: m.eval(); sacred_modules.append(m)
+        
+        # Step 1: Forward & Backward (using framework's native engine)
+        res = _original_train_step(x, target_data=target_data, **kwargs)
+        
+        # Step 2: DUAL-RATE GRADIENT ENGINE (Lock + Boost)
+        # Sacred = 0.0x (Lock) | Non-Sacred = 1.2x (Plasticity Boost)
+        if hasattr(self.memory, 'sacred_mask'):
+            for name, p in self.model.named_parameters():
+                if p.grad is None: continue
+                
+                is_p_sacred = False
+                combined_mask = torch.zeros_like(p.grad, dtype=torch.bool)
+                for exp_idx in range(max(1, num_experts)):
+                    key = f"m{exp_idx}_{name}"
+                    if key in self.memory.sacred_mask:
+                        combined_mask |= self.memory.sacred_mask[key].to(p.device)
+                        is_p_sacred = True
+                
+                if is_p_sacred:
+                    multiplier = torch.where(combined_mask, 0.0, 1.2)
+                    p.grad.data.mul_(multiplier.to(p.grad.dtype))
+                else:
+                    p.grad.data.mul_(1.2)
 
-            # Post-step BN restore
-            for m in sacred_modules: m.train()
-            return res
+        for m in sacred_modules: m.train()
+        return res
     
     model.train_step = types.MethodType(_v18_absolute_zero_train_step, model)
-    print("             [V18.8_SINGULARITY] Absolute Zero Protection Enabled.")
+    print("             [V18.9.2_CLEAN] Dual-Rate Engine Enabled (Sync with Native AMP).")
     # ===========================================================================
 
     if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
