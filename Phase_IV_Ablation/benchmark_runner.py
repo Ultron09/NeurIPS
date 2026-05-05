@@ -389,21 +389,26 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         # Step: Forward & Backward
         res = _original_train_step(x, target_data=target_data, **kwargs)
         
-        # 3. FAST DUAL-RATE STEP
+        # 3. FAST DUAL-RATE STEP (V20 BERSERKER)
         with torch.no_grad():
-            # [V19] Hyper-Boost Detection
             is_plastic_task = getattr(self, 'current_task', 0) > 0
-            plastic_multiplier = 2.5 if is_plastic_task else 1.2
             
             for name, p in self.model.named_parameters():
                 if p.grad is not None and name in self.memory._v18_grad_multipliers:
-                    # Apply pre-compiled multiplier (which includes the 0.0 lock)
-                    # If it's a plastic task, we scale the 1.2 part up to 2.5
                     m = self.memory._v18_grad_multipliers[name]
                     if is_plastic_task:
-                        # Convert 1.2 elements to 2.5, keep 0.0 as 0.0
-                        m = torch.where(m > 0.1, 2.5, 0.0).to(p.device)
-                    p.grad.data.mul_(m)
+                        # [V20] 4.0x Ultra-Boost for plastic | Physical zero_() for sacred
+                        # m == 0.0 means sacred, m > 0.1 means plastic
+                        sacred_mask = (m < 0.1)
+                        if sacred_mask.any():
+                            p.grad.data.masked_fill_(sacred_mask, 0.0)
+                        
+                        # Apply 4.0x boost to the remaining (plastic) parts
+                        # 1.0 -> 4.0
+                        p.grad.data.mul_(4.0)
+                    else:
+                        # Task 0 Standard
+                        p.grad.data.mul_(m)
 
         for m in self.memory._v18_sacred_bns: m.train()
         return res
@@ -452,14 +457,15 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         n_epochs = 8 
         print(f"\n[WARRIOR] Starting Task {t_idx} | Regime: {'FOUNDATION' if t_idx==0 else 'HYPER-PLASTIC'} | Epochs: {n_epochs}")
         
-        # [V19] AUTONOMIC DRIVE: Disable high-overhead features for Tasks 1-9
+        # [V20] AUTONOMIC DRIVE + BERSERKER STABILIZATION
         if t_idx > 0:
             original_train_single = trainer.train_task
-            def _v19_autonomic_train(loader, task_id, epochs, replay_buffer=None):
+            def _v20_berserker_train(loader, task_id, epochs, replay_buffer=None):
+                # Inject Label Smoothing for Tasks 1-9 to stabilize the 4.0x boost
                 return train_single_task(trainer.model, loader, loader, trainer.optimizer, task_id, 
                                        device=trainer.device, epochs=epochs, replay_buffer=replay_buffer,
-                                       enable_dream=False, meta_step=False) # FAST MODE
-            trainer.train_task = _v19_autonomic_train
+                                       enable_dream=False, meta_step=False, label_smoothing=0.1) 
+            trainer.train_task = _v20_berserker_train
 
         trainer.train_task(train_loader, t_idx, epochs=n_epochs, replay_buffer=replay_buf if t_idx > 0 else None)
         
