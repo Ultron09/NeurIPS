@@ -433,6 +433,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         # Optimize DataLoader for speed
         train_loader.num_workers = 4
         train_loader.pin_memory = True
+        train_loader.prefetch_factor = 2 # Fix TypeError in newer PyTorch/Python versions
         
         test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
         trainer.train_task(train_loader, t_idx, epochs=n_epochs, replay_buffer=replay_buf if t_idx > 0 else None)
