@@ -185,6 +185,11 @@ def validate(model, loader, seen_classes, device, is_antara=False, hat_module=No
                 # This forces autonomous MoE routing and global head prediction.
                 try:
                     logits = model.inference_step(x, task_id=None)
+                    if isinstance(logits, tuple): logits = logits[0]
+                    # [DIAGNOSTIC] Check for label space mismatch
+                    if random.random() < 0.05:
+                        preds = logits.argmax(dim=1)
+                        print(f"             [VAL DEBUG] Task {t_idx} | y range: {y.min().item()}-{y.max().item()} | Preds range: {preds.min().item()}-{preds.max().item()} | Logits shape: {logits.shape}", flush=True)
                     if isinstance(logits, tuple):
                         logits = logits[0]
                 except Exception:

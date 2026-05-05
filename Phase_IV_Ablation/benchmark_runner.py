@@ -72,8 +72,8 @@ if hasattr(moe_mod, 'SparseMoE'):
                 # Weighted accumulation
                 final_output[mask] += expert_out * w[mask].view(-1, 1)
 
-        # [DIAGNOSTIC] Periodic expert usage print
-        if random.random() < 0.001:
+        # [DIAGNOSTIC] Periodic expert usage print (increased frequency for Task 1)
+        if random.random() < 0.01:
             usage = torch.bincount(indices.view(-1), minlength=self.num_experts)
             print(f"             [MoE] Expert Usage: {usage.tolist()}")
 
@@ -503,6 +503,14 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # during backward, so we don't need pre-backward hooks here.
         if is_plastic:
             with torch.no_grad():
+                # [DIAGNOSTIC] Check for label space mismatch periodically during training
+                if random.random() < 0.005:
+                    test_logits = self.inference_step(x[:8], task_id=None)
+                    if isinstance(test_logits, tuple): test_logits = test_logits[0]
+                    test_preds = test_logits.argmax(dim=1)
+                    y_true = target_data[:8] if target_data is not None else torch.zeros(1)
+                    print(f"             [TRAIN DEBUG] Task {current_task_id} | y range: {y_true.min().item()}-{y_true.max().item()} | Preds range: {test_preds.min().item()}-{test_preds.max().item()}", flush=True)
+
                 for p, mult, anc, mask in self.memory._v24_flat_grad_logic:
                     if mask.any():
                         p.data.copy_(torch.where(
@@ -510,6 +518,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                             anc.to(p.device),
                             p.data
                         ))
+                    # [TELEMETRY] MoE usage
+                    if random.random() < 0.01:
+                        print(f"             [MOE DEBUG] Active experts usage logged.", flush=True)
 
         for m in self.memory._v18_sacred_bns:
             m.train()
@@ -536,6 +547,19 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         train_loader.num_workers = 0; train_loader.pin_memory = True; train_loader.prefetch_factor = None
         
         print("             [DEBUG] Pre-warming Protection Map...")
+        # [V30.1] Explicitly unlock current task's head neurons
+        # This prevents the sacred mask from blocking gradients to the new classes
+        if hasattr(model.memory, 'sacred_mask'):
+            classes_per_task = 10 if dataset_name == "CIFAR100" else 20
+            fc_keys = [k for k in model.memory.sacred_mask if 'fc' in k.lower()]
+            for k in fc_keys:
+                s, e = t_idx * classes_per_task, (t_idx + 1) * classes_per_task
+                mask = model.memory.sacred_mask[k]
+                if mask.dim() >= 1 and mask.size(0) >= e:
+                    with torch.no_grad():
+                        mask[s:e].zero_()
+            print(f"             [IRON MIND] Unlocked head neurons for Task {t_idx} (indices {t_idx*classes_per_task}-{(t_idx+1)*classes_per_task-1})")
+
         model.pre_warm_protection_map()
         print(f"\n[WARRIOR] Starting Task {t_idx} | Epochs: {EPOCHS_PER_TASK}")
         
