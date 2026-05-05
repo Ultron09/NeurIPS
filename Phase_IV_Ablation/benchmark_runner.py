@@ -408,15 +408,31 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
                 curr_pos += p_n
 
-        # [NeurIPS] DO NOT hard-lock gate params entirely. 
-        # The gate must remain plastic to learn new task routing. 
-        # We only apply the standard 8% quota to the gate if it's large, 
-        # but for this ResNet-MoE, the gate should be mostly plastic.
+        # [NeurIPS] Keep gate plastic — it must route new tasks autonomously.
+        # Remove gate params from the hard-lock so routing can adapt.
+        for pid in list(cumulative.keys()):
+            prefixed_name = id_to_prefixed_name.get(pid, "")
+            if "gate" in prefixed_name.lower():
+                del cumulative[pid]
+
+        # [NeurIPS] FC head: lock only completed-task rows (0..(task_id+1)*cpt-1).
+        # The governor runs AFTER training task_id, so task_id rows are now complete.
+        # This ensures future tasks can freely train their own FC rows.
+        classes_per_task_cfg = config.classes_per_task
         for pid, prefixed_name in id_to_prefixed_name.items():
-            if "gate" in prefixed_name.lower() and pid in id_to_p:
-                # Ensure gate stays out of the hard-locked cumulative mask for now
-                if pid in cumulative:
-                    del cumulative[pid]
+            if pid not in id_to_p:
+                continue
+            p = id_to_p[pid][1]
+            if 'fc' in prefixed_name.lower() and 'weight' in prefixed_name.lower() and p.dim() == 2:
+                fc_mask = torch.zeros(p.shape, dtype=torch.bool, device=p.device)
+                lock_up_to = min((task_id + 1) * classes_per_task_cfg, p.shape[0])
+                fc_mask[:lock_up_to, :] = True
+                cumulative[pid] = cumulative[pid] | fc_mask if pid in cumulative else fc_mask
+            elif 'fc' in prefixed_name.lower() and 'bias' in prefixed_name.lower() and p.dim() == 1:
+                fc_mask = torch.zeros(p.shape, dtype=torch.bool, device=p.device)
+                lock_up_to = min((task_id + 1) * classes_per_task_cfg, p.shape[0])
+                fc_mask[:lock_up_to] = True
+                cumulative[pid] = cumulative[pid] | fc_mask if pid in cumulative else fc_mask
 
         # Commit to mem
         dev = next(backbone_ref.parameters()).device
@@ -491,28 +507,40 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             m.eval()
 
         current_task_id = kwargs.get('task_id', getattr(self, 'current_task', 0))
-        is_plastic = (current_task_id is not None and current_task_id > 0)
+        if current_task_id is None:
+            current_task_id = 0
+        is_plastic = current_task_id > 0
 
         # Run the full train_step (backward + optimizer.step() happen inside)
         res = _orig_train_step(x, target_data=target_data, **kwargs)
 
         # Post-step: hard-restore sacred weights to anchor values.
-        # This is the correct place — after optimizer.step() has already run.
-        # It catches drift from weight decay, lookahead, and reptile.
-        # The SI+EWC penalty (compute_penalty) handles gradient-level protection
-        # during backward, so we don't need pre-backward hooks here.
+        # CRITICAL: For the FC head, only restore rows belonging to COMPLETED tasks.
+        # Restoring the current task's FC rows would zero out what the optimizer
+        # just learned — this is exactly why task 1 was predicting 0-9.
         if is_plastic:
-            with torch.no_grad():
-                # [DIAGNOSTIC] Check for label space mismatch periodically during training (10% freq)
-                if random.random() < 0.1:
-                    test_logits = self.inference_step(x[:8], task_id=None)
-                    if isinstance(test_logits, tuple): test_logits = test_logits[0]
-                    test_preds = test_logits.argmax(dim=1)
-                    y_true = target_data[:8] if target_data is not None else torch.zeros(1)
-                    print(f"             [TRAIN DEBUG] Task {current_task_id} | y range: {y_true.min().item()}-{y_true.max().item()} | Preds range: {test_preds.min().item()}-{test_preds.max().item()}", flush=True)
+            classes_per_task = getattr(self.config, 'classes_per_task', 10)
+            # Rows 0 .. (current_task_id * classes_per_task - 1) are completed tasks
+            completed_classes = current_task_id * classes_per_task
 
+            with torch.no_grad():
                 for p, mult, anc, mask in self.memory._v24_flat_grad_logic:
-                    if mask.any():
+                    if not mask.any():
+                        continue
+                    # Check if this is the FC weight (2D, first dim = num_classes)
+                    is_fc = (p.dim() == 2 and p.shape[0] == num_classes)
+                    if is_fc:
+                        # Only restore completed-task rows; leave current-task rows free
+                        restore_mask = mask.clone()
+                        restore_mask[completed_classes:] = False
+                        if restore_mask.any():
+                            p.data.copy_(torch.where(
+                                restore_mask.to(p.device),
+                                anc.to(p.device),
+                                p.data
+                            ))
+                    else:
+                        # Non-FC params: restore all sacred positions
                         p.data.copy_(torch.where(
                             mask.to(p.device),
                             anc.to(p.device),
@@ -544,18 +572,22 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         train_loader.num_workers = 0; train_loader.pin_memory = True; train_loader.prefetch_factor = None
         
         print("             [DEBUG] Pre-warming Protection Map...")
-        # [V30.1] Explicitly unlock current task's head neurons
-        # This prevents the sacred mask from blocking gradients to the new classes
-        if hasattr(model.memory, 'sacred_mask'):
-            classes_per_task = 10 if dataset_name == "CIFAR100" else 20
-            fc_keys = [k for k in model.memory.sacred_mask if 'fc' in k.lower()]
-            for k in fc_keys:
-                s, e = t_idx * classes_per_task, (t_idx + 1) * classes_per_task
-                mask = model.memory.sacred_mask[k]
-                if mask.dim() >= 1 and mask.size(0) >= e:
+        # [NeurIPS] Before training task t_idx, ensure the current task's FC rows
+        # are NOT in the sacred mask. The governor locks rows 0..(t_idx-1)*cpt after
+        # each task, so rows t_idx*cpt onwards should already be free. This is a
+        # safety check to guarantee plasticity for the current task's output neurons.
+        classes_per_task_local = config.classes_per_task
+        s_unlock = t_idx * classes_per_task_local
+        e_unlock = (t_idx + 1) * classes_per_task_local
+        for k, mask in model.memory.sacred_mask.items():
+            if 'fc' in k.lower():
+                if mask.dim() >= 1 and mask.shape[0] >= e_unlock:
                     with torch.no_grad():
-                        mask[s:e].zero_()
-            print(f"             [IRON MIND] Unlocked head neurons for Task {t_idx} (indices {t_idx*classes_per_task}-{(t_idx+1)*classes_per_task-1})")
+                        mask[s_unlock:e_unlock].zero_()
+                elif mask.dim() >= 2 and mask.shape[0] >= e_unlock:
+                    with torch.no_grad():
+                        mask[s_unlock:e_unlock, :].zero_()
+        print(f"             [IRON MIND] FC rows {s_unlock}-{e_unlock-1} unlocked for Task {t_idx}")
 
         model.pre_warm_protection_map()
         print(f"\n[WARRIOR] Starting Task {t_idx} | Epochs: {EPOCHS_PER_TASK}")
