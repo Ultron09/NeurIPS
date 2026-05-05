@@ -235,8 +235,12 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     model.memory.task_omega_snapshots = {} 
 
     def _v18_governor_patch(mem, task_id, backbone_ref):
-        """V18 IRON SOUL: Device-safe sacred mask with correct m{idx}_ key prefix."""
-        PER_TASK_QUOTA = 0.08 
+        # [V18.5] FLUID SOUL: Dynamically calculate quota from framework state
+        total_quota = getattr(mem.config, 'iron_mind_quota', 0.35)
+        num_tasks = getattr(mem, 'total_tasks', 10)
+        # Use 8% if possible, but stay within the global limit per task
+        PER_TASK_QUOTA = min(0.08, total_quota / max(1, num_tasks))
+        
         MIN_IMPORTANCE = 1e-5 
         id_to_p = {}; id_to_imp = {}
         id_to_prefixed_name = {}
@@ -337,8 +341,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     def _v18_zenith_train_step(self, *args, **kwargs):
         sacred_modules = []
         if hasattr(self.memory, 'sacred_mask'):
-            # Detect all experts m0, m1, m2, m3...
-            num_experts = len(getattr(self.memory, 'models', []))
+            # Detect experts dynamically from the memory or config
+            experts = getattr(self.memory, 'models', [])
+            num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
+            
             for m_name, m in self.model.named_modules():
                 if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
                     is_sacred = False
