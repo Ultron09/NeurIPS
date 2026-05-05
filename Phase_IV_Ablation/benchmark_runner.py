@@ -270,6 +270,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
             thr = max(torch.kthvalue(flat, k).values.item(), MIN_IMPORTANCE)
             for pid, imp in snap.items():
                 m = (imp >= thr).bool().cpu()
+                # [V18.4] ETERNAL SOUL: Force Router/Gate parameters into the sacred mask
+                p_name = id_to_prefixed_name.get(pid, "").lower()
+                if "gate" in p_name or "router" in p_name:
+                    m = torch.ones_like(m).bool()
                 cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
         
         # Apply the final union mask
@@ -317,6 +321,17 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     # Kill Layer 5: Surgical weight decay on non-sacred params
     model._compute_surgical_weight_decay = lambda *a, **k: torch.tensor(0.0, device=device)
     
+    # [V18.4] ETERNAL SOUL: Stabilize MoE Routing
+    # Force the MoE temperature to stay soft (floor at 0.75) to prevent Routing Collapse.
+    if hasattr(model, 'meta_controller'):
+        _orig_on_task = model.on_task_complete
+        def _v18_eternal_on_task(self, task_id):
+            _orig_on_task(task_id)
+            if hasattr(self.meta_controller, 'temp'):
+                self.meta_controller.temp = max(0.75, self.meta_controller.temp)
+                print(f"             [V18.4_STABILITY] MoE Temperature stabilized at {self.meta_controller.temp:.4f}")
+        model.on_task_complete = types.MethodType(_v18_eternal_on_task, model)
+
     # [V18.3] ZENITH BN CRYOSTASIS: Multi-Expert Expert-Aware Locking
     _original_train_step = model.train_step
     def _v18_zenith_train_step(self, *args, **kwargs):
