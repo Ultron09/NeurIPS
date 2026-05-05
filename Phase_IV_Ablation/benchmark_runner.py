@@ -276,7 +276,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     model = torch.compile(model, mode="reduce-overhead")
     
     # Run a dummy pass to trigger JIT compilation before the loop
-    with torch.cuda.amp.autocast():
+    with torch.amp.autocast('cuda'):
         dummy_x = torch.randn(8, 3, 32, 32).to(device)
         try:
             _ = model(dummy_x)
