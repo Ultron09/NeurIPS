@@ -336,37 +336,41 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
                 print(f"             [V18.4_STABILITY] MoE Temperature stabilized at {self.meta_controller.temp:.4f}")
         model.on_task_complete = types.MethodType(_v18_eternal_on_task, model)
 
-    # [V18.3] ZENITH BN CRYOSTASIS: Multi-Expert Expert-Aware Locking
+    # [V18.6] SINGULARITY: Speed (AMP) + Stability (Logit Isolation)
+    from torch.cuda.amp import autocast, GradScaler
+    model.scaler = GradScaler()
+    
     _original_train_step = model.train_step
-    def _v18_zenith_train_step(self, *args, **kwargs):
-        sacred_modules = []
-        if hasattr(self.memory, 'sacred_mask'):
-            # Detect experts dynamically from the memory or config
-            experts = getattr(self.memory, 'models', [])
-            num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
+    def _v18_singularity_train_step(self, x, target_data=None, **kwargs):
+        # Enable Mixed Precision for speed
+        with autocast():
+            # [V18.3] ZENITH BN CRYOSTASIS logic integrated
+            sacred_modules = []
+            if hasattr(self.memory, 'sacred_mask'):
+                experts = getattr(self.memory, 'models', [])
+                num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
+                for m_name, m in self.model.named_modules():
+                    if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
+                        is_sacred = False
+                        for exp_idx in range(max(1, num_experts)):
+                            unique_name_prefix = f"m{exp_idx}_{m_name}"
+                            for p_name, _ in m.named_parameters(recurse=False):
+                                full_name = f"{unique_name_prefix}.{p_name}"
+                                if full_name in self.memory.sacred_mask and self.memory.sacred_mask[full_name].any():
+                                    is_sacred = True; break
+                            if is_sacred: break
+                        if is_sacred:
+                            m.eval(); sacred_modules.append(m)
             
-            for m_name, m in self.model.named_modules():
-                if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
-                    is_sacred = False
-                    # Check across ALL experts for sacred weights in this layer
-                    for exp_idx in range(max(1, num_experts)):
-                        unique_name_prefix = f"m{exp_idx}_{m_name}"
-                        for p_name, _ in m.named_parameters(recurse=False):
-                            full_name = f"{unique_name_prefix}.{p_name}"
-                            if full_name in self.memory.sacred_mask and self.memory.sacred_mask[full_name].any():
-                                is_sacred = True; break
-                        if is_sacred: break
-                    
-                    if is_sacred:
-                        m.eval(); sacred_modules.append(m)
-        
-        res = _original_train_step(*args, **kwargs)
-        for m in sacred_modules: m.train()
-        return res
+            res = _original_train_step(x, target_data=target_data, **kwargs)
+            
+            # Post-step restoration
+            for m in sacred_modules: m.train()
+            return res
     
-    model.train_step = types.MethodType(_v18_zenith_train_step, model)
+    model.train_step = types.MethodType(_v18_singularity_train_step, model)
     
-    print("             [V18.3_ZENITH] Multi-Expert BN Lock Active. Experts 0-3 Protected.")
+    print("             [V18.6_SINGULARITY] AMP Hyper-Drive & Zenith BN Lock Active.")
     # ===========================================================================
 
     if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
@@ -398,11 +402,17 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
 
     for t_idx in range(num_tasks):
         train_loader, _, _ = curriculum.get_task(t_idx)
+        # [V18.7] SPEED: Task 0 needs 10 epochs for foundation, others can thrive on 7
+        n_epochs = 10 if t_idx == 0 else 7
+        
+        # Optimize DataLoader for speed
+        train_loader.num_workers = 4
+        train_loader.pin_memory = True
+        
         test_loaders = [curriculum.get_task(i)[2] for i in range(t_idx + 1)]
-        trainer.train_task(train_loader, t_idx, epochs=10, replay_buffer=replay_buf if t_idx > 0 else None)
+        trainer.train_task(train_loader, t_idx, epochs=n_epochs, replay_buffer=replay_buf if t_idx > 0 else None)
         
         # [V30.1] Store CLEAN exemplars BEFORE consolidation
-        # We pass the underlying dataset and indices to avoid augmented samples
         train_indices = train_loader.dataset.indices
         base_dataset = train_loader.dataset.dataset
         replay_buf.update_from_loader(base_dataset, train_indices, dataset_name=dataset_name)
@@ -437,6 +447,11 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         acc_str = ", ".join([f"T{i}: {acc:.2%}" for i, acc in enumerate(task_accuracies)])
         
         usage = get_resource_usage()
+        # [LIVE_DEBUG] Telemetry and Memory Cleanup
+        print(f"\n             [V18.7_SPEED] Task {t_idx} Finished in {(time.time() - start_time)/60:.1f}m total.")
+        torch.cuda.empty_cache()
+        import gc; gc.collect()
+        
         print(f"\n[LIVE_DEBUG] Task {t_idx} Finished | Average Accuracy: {avg_acc:.2%}")
         print(f"             Accuracies: [{acc_str}]")
         print(f"             Resource: VRAM {usage['vram_peak_gb']:.2f}GB | Power {usage['avg_power_w']:.1f}W")
