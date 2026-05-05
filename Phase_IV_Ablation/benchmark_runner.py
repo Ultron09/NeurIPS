@@ -418,21 +418,28 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # [NeurIPS] FC head: lock only completed-task rows (0..(task_id+1)*cpt-1).
         # The governor runs AFTER training task_id, so task_id rows are now complete.
         # This ensures future tasks can freely train their own FC rows.
+        # NOTE: fc_mask must be on CPU to match cumulative tensors (built from CPU importance).
         classes_per_task_cfg = config.classes_per_task
         for pid, prefixed_name in id_to_prefixed_name.items():
             if pid not in id_to_p:
                 continue
             p = id_to_p[pid][1]
             if 'fc' in prefixed_name.lower() and 'weight' in prefixed_name.lower() and p.dim() == 2:
-                fc_mask = torch.zeros(p.shape, dtype=torch.bool, device=p.device)
+                fc_mask = torch.zeros(p.shape, dtype=torch.bool)  # CPU
                 lock_up_to = min((task_id + 1) * classes_per_task_cfg, p.shape[0])
                 fc_mask[:lock_up_to, :] = True
-                cumulative[pid] = cumulative[pid] | fc_mask if pid in cumulative else fc_mask
+                if pid in cumulative:
+                    cumulative[pid] = cumulative[pid].cpu() | fc_mask
+                else:
+                    cumulative[pid] = fc_mask
             elif 'fc' in prefixed_name.lower() and 'bias' in prefixed_name.lower() and p.dim() == 1:
-                fc_mask = torch.zeros(p.shape, dtype=torch.bool, device=p.device)
+                fc_mask = torch.zeros(p.shape, dtype=torch.bool)  # CPU
                 lock_up_to = min((task_id + 1) * classes_per_task_cfg, p.shape[0])
                 fc_mask[:lock_up_to] = True
-                cumulative[pid] = cumulative[pid] | fc_mask if pid in cumulative else fc_mask
+                if pid in cumulative:
+                    cumulative[pid] = cumulative[pid].cpu() | fc_mask
+                else:
+                    cumulative[pid] = fc_mask
 
         # Commit to mem
         dev = next(backbone_ref.parameters()).device
