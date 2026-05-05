@@ -291,16 +291,34 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     model.memory._v18_update = _v18_governor_patch
 
     
-    def _make_hook(p_id, mem):
-        def hook(grad):
-            m = mem.param_id_to_mask.get(p_id)
-            if m is not None: return grad * (~m.to(grad.device))
-            return grad
-        return hook
+    # NOTE: Gradient hooks REMOVED — the package's CAS (1200 Gradient Shunts)
+    # already protects sacred parameters. Adding our own hooks on top was
+    # causing double-protection, killing plasticity and blocking positive
+    # backward transfer that was seen in the "golden" runs.
 
-    for tracked_model in model.memory.models:
-        for p in tracked_model.parameters():
-            if p.requires_grad: p.register_hook(_make_hook(id(p), model.memory))
+    # ==================== BINARY PROTECTION (V18 IRON SOUL) ====================
+    # Philosophy: Sacred 8% = HARD FROZEN (CAS + Restoration).
+    #             Non-sacred 92% = 100% PLASTIC. No half-measures.
+    #
+    # Kill Layer 2: SI/EWC penalty loss (was dragging ALL 93.8M params to anchors)
+    model.memory.compute_penalty = lambda *a, **k: torch.tensor(0.0, device=device)
+    
+    # Kill Layer 4: LR Gating (was scaling gradients to 20% on low-surprise data)
+    # We force "high surprise" so the gate stays at 1.0 (full gradient flow).
+    if model.world_model:
+        _original_compute_surprise = model.world_model.compute_surprise
+        def _full_plasticity_surprise(z_pred, z_actual):
+            # Return surprise=4.0 → lr_gate = min(1.0, 4.0/4.0) = 1.0
+            # Keep actual WM loss for logging but don't let it gate learning
+            _, wm_loss = _original_compute_surprise(z_pred, z_actual)
+            return torch.tensor(4.0, device=z_pred.device), wm_loss
+        model.world_model.compute_surprise = _full_plasticity_surprise
+    
+    # Kill Layer 5: Surgical weight decay on non-sacred params
+    model._compute_surgical_weight_decay = lambda *a, **k: torch.tensor(0.0, device=device)
+    
+    print("             [V18_BINARY] Half-lock mechanisms disabled. CAS-only protection active.")
+    # ===========================================================================
 
     if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
         def _patched_reptile(self_rep):
@@ -318,6 +336,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
             self_rep.anchor_weights = self_rep._clone_weights()
         model.meta_controller.reptile._perform_update = types.MethodType(_patched_reptile, model.meta_controller.reptile)
     # =========================================================================
+
     
     results = []
     start_time = time.time()
