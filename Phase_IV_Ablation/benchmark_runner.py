@@ -26,6 +26,8 @@ if hasattr(moe_mod, 'SparseMoE'):
             
         # Simplified routing logic for compilation
         logits = self.gate(x, consciousness_state=consciousness_state)
+        if isinstance(logits, tuple): logits = logits[0]
+        
         if explore:
             indices = torch.randint(0, self.num_experts, (x.size(0),), device=x.device)
         else:
