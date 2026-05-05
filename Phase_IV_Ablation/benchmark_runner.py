@@ -31,8 +31,9 @@ from torchvision import transforms
 if hasattr(moe_mod, 'SparseMoE'):
     print("             [NeurIPS] Deploying Weighted MoE Dispatcher (top-k weighted sum)...")
     def _weighted_sparse_fwd(self, x, task_id=None, consciousness_state=None, *args, **kwargs):
-        # 1. Gating — returns (weights [B, top_k], indices [B, top_k])
-        gate_out = self.gate(x, task_id=task_id, consciousness_state=consciousness_state)
+        # [NeurIPS] Force autonomous routing: ignore task_id for gating.
+        # This ensures the gate learns to route based on features, not an oracle.
+        gate_out = self.gate(x, task_id=None, consciousness_state=consciousness_state)
         if isinstance(gate_out, tuple):
             weights, indices = gate_out
         else:
@@ -44,7 +45,7 @@ if hasattr(moe_mod, 'SparseMoE'):
         # Cache output dim for efficiency
         if not hasattr(self, '_v24_out_dim'):
             with torch.no_grad():
-                test_out = self.experts[0](x[:1], task_id=task_id)
+                test_out = self.experts[0](x[:1], task_id=None)
                 if isinstance(test_out, tuple): test_out = test_out[0]
                 self._v24_out_dim = test_out.shape[1]
 
@@ -58,7 +59,8 @@ if hasattr(moe_mod, 'SparseMoE'):
             for i in range(self.num_experts):
                 mask = (expert_idx_per_sample == i)
                 if not mask.any(): continue
-                expert_out = self.experts[i](x[mask], task_id=task_id)
+                # Pass task_id=None to experts as well to ensure they learn task-agnostic features
+                expert_out = self.experts[i](x[mask], task_id=None)
                 if isinstance(expert_out, tuple): 
                     expert_out = expert_out[0]
                 
@@ -69,6 +71,11 @@ if hasattr(moe_mod, 'SparseMoE'):
                     
                 # Weighted accumulation
                 final_output[mask] += expert_out * w[mask].view(-1, 1)
+
+        # [DIAGNOSTIC] Periodic expert usage print
+        if random.random() < 0.001:
+            usage = torch.bincount(indices.view(-1), minlength=self.num_experts)
+            print(f"             [MoE] Expert Usage: {usage.tolist()}")
 
         return final_output, indices
 
