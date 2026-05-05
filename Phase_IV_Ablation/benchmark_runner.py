@@ -12,41 +12,40 @@ from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 import airborne_antara.moe as moe_mod
 from torchvision.models.resnet import ResNet, BasicBlock
 
-# [V23.0] CLEAN SLATE: Re-implementing MoE to remove .item() graph breaks
+# [V24.0] HYPER-FUSED: Re-implementing MoE for A100 Static Graphs
 if hasattr(moe_mod, 'SparseMoE'):
-    print("             [V23.0] Surgically Re-implementing SparseMoE for A100 Unity...")
+    print("             [V24.0] Deploying Static MoE Dispatcher...")
     def _unified_sparse_fwd(self, x, task_id=None, consciousness_state=None, *args, **kwargs):
-        # [V23.0] RE-IMPLEMENTED FOR GRAPH UNITY
-        # Removed torch.rand(1).item() < 0.1 which caused the hang.
-        if self.training and self.num_experts > 1:
-            # Stays in tensor-land. No CPU sync.
-            explore = (torch.rand(1, device=x.device) < 0.1).all()
-        else:
-            explore = False
-            
-        # Simplified routing logic for compilation
+        # 1. Static Routing Logic (Fused)
         logits = self.gate(x, consciousness_state=consciousness_state)
         if isinstance(logits, tuple): logits = logits[0]
         
-        if explore:
-            indices = torch.randint(0, self.num_experts, (x.size(0),), device=x.device)
-        else:
-            indices = torch.argmax(logits, dim=-1)
+        # Stochastic path without graph breaks
+        explore_prob = 0.1 if self.training and self.num_experts > 1 else 0.0
+        explore_mask = (torch.rand(x.size(0), 1, device=x.device) < explore_prob)
+        
+        best_indices = torch.argmax(logits, dim=-1)
+        rand_indices = torch.randint(0, self.num_experts, (x.size(0),), device=x.device)
+        indices = torch.where(explore_mask.squeeze(), rand_indices, best_indices)
             
-        # Dispatch to experts
-        outputs = None
+        # 2. Static Dispatch (No None checks, No mask.any breaks)
+        # We assume 100 classes for the classifier; dynamically fetch if needed.
+        if not hasattr(self, '_v24_out_dim'):
+            # One-time probe
+            with torch.no_grad():
+                test_out = self.experts[0](x[:1], task_id=task_id)
+                if isinstance(test_out, tuple): test_out = test_out[0]
+                self._v24_out_dim = test_out.shape[1]
+        
+        outputs = torch.zeros(x.size(0), self._v24_out_dim, device=x.device, dtype=x.dtype)
         for i in range(self.num_experts):
             mask = (indices == i)
-            if mask.any():
-                expert_out = self.experts[i](x[mask], task_id=task_id)
-                # Ensure expert_out is same shape
-                if isinstance(expert_out, tuple): expert_out = expert_out[0]
-                
-                if outputs is None:
-                    # Lazy init based on first expert's output shape
-                    outputs = torch.zeros(x.size(0), *expert_out.shape[1:], device=x.device, dtype=x.dtype)
-                
-                outputs[mask] = expert_out
+            # We use a small epsilon to keep the graph static if needed, 
+            # but mask indexing is generally okay if indices is a tensor.
+            expert_out = self.experts[i](x[mask], task_id=task_id)
+            if isinstance(expert_out, tuple): expert_out = expert_out[0]
+            outputs[mask] = expert_out
+            
         return outputs, indices
 
     moe_mod.SparseMoE.forward = _unified_sparse_fwd
@@ -386,12 +385,13 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     
     @torch._dynamo.disable
     def _v18_pre_warm_protection_map(self):
-        """[V23.0] Mark as Disabled for Compiler to avoid Sympy hangs."""
+        """[V24.0] Flattened Gradient Engine for A100 Speed."""
         experts = getattr(self.memory, 'models', [])
         num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
         
-        print("             [V18.11] Pre-warming Speed-Optimized Protection Map...")
+        print("             [V24.0] Flattening Gradient Engine for Warp Speed...")
         self.memory._v18_grad_multipliers = {}
+        self.memory._v24_flat_grad_logic = [] # (Parameter, MultiplierTensor, AnchorTensor)
         self.memory._v18_sacred_bns = []
         
         with torch.no_grad():
@@ -403,10 +403,12 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
                     if key in self.memory.sacred_mask:
                         combined_mask |= self.memory.sacred_mask[key].to(p.device)
                         found = True
-                if found:
-                    self.memory._v18_grad_multipliers[name] = torch.where(combined_mask, 0.0, 1.2).to(p.device)
-                else:
-                    self.memory._v18_grad_multipliers[name] = 1.2
+                
+                mult = torch.where(combined_mask, 0.0, 1.2).to(p.device) if found else torch.full_like(p, 1.2)
+                anc = self.memory.anchor.get(name, p.data.clone()).to(p.device)
+                
+                self.memory._v18_grad_multipliers[name] = mult
+                self.memory._v24_flat_grad_logic.append((p, mult, anc, combined_mask))
 
             for m_name, m in self.model.named_modules():
                 if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
@@ -431,29 +433,21 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         # Step: Forward & Backward
         res = _original_train_step(x, target_data=target_data, **kwargs)
         
-        # 3. FAST DUAL-RATE STEP (V20.1 STABILIZED BERSERKER)
+        # 3. FAST FLAT-GRAD ENGINE (V24.0 HYPER-FUSED)
         with torch.no_grad():
             is_plastic_task = getattr(self, 'current_task', 0) > 0
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             
-            for name, p in self.model.named_parameters():
-                if p.grad is not None and name in self.memory._v18_grad_multipliers:
-                    m = self.memory._v18_grad_multipliers[name]
+            for p, mult, anc, mask in self.memory._v24_flat_grad_logic:
+                if p.grad is not None:
                     if is_plastic_task:
-                        # [V22] Absolute Zero: Hard Gradient Lock
-                        sacred_mask = (m < 0.1)
-                        if sacred_mask.any():
-                            p.grad.data.masked_fill_(sacred_mask, 0.0)
-                            # Physical parameter restoration (Absolute Zero Protection)
-                            anchor_key = name # We assume names match or handle prefixing
-                            if anchor_key in self.memory.anchor:
-                                anc = self.memory.anchor[anchor_key].to(p.device)
-                                p.data.copy_(torch.where(sacred_mask, anc, p.data))
-                        
-                        # [V22] Berserker Boost
+                        # Absolute Zero Hard-Lock
+                        p.grad.data.masked_fill_(mask, 0.0)
+                        p.data.copy_(torch.where(mask, anc, p.data))
+                        # Hyper-Plasticity Boost
                         p.grad.data.mul_(4.0)
                     else:
-                        p.grad.data.mul_(m)
+                        p.grad.data.mul_(mult)
 
         for m in self.memory._v18_sacred_bns: m.train()
         return res
