@@ -299,6 +299,22 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                         cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool, device=fc.bias.device)
                     cumulative[fc_b_id][s:e] = True
 
+        # Hard-lock MoE gate routing rows for completed tasks (exact from backup)
+        # This preserves routing for old tasks while allowing new task routing to develop
+        for m_tracked in mem.models:
+            for name, module in m_tracked.named_modules():
+                if "gate" in name.lower() and hasattr(module, 'weight') and hasattr(module, 'gate'):
+                    # This is a GatingNetwork — lock the gate.gate linear layer rows
+                    gate_linear = module.gate
+                    g_id = id(gate_linear.weight)
+                    if g_id not in cumulative:
+                        cumulative[g_id] = torch.zeros(gate_linear.weight.shape, dtype=torch.bool,
+                                                        device=gate_linear.weight.device)
+                    num_experts = gate_linear.weight.shape[0]
+                    for tid in mem.task_omega_snapshots:
+                        target_expert = tid % num_experts
+                        cumulative[g_id][target_expert, :] = True
+
         # Commit
         mem.param_id_to_mask = {}
         all_names = {}
@@ -367,7 +383,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         print("  [IRON MIND] Reptile protection active.")
 
     # ── Training setup ─────────────────────────────────────────────────────────
-    EPOCHS     = epochs_override if epochs_override is not None else 20
+    EPOCHS     = epochs_override if epochs_override is not None else 25
     replay_buf = ExternalReplayBuffer(
         per_task=2000,
         img_size=64 if dataset_name == "TinyImageNet" else 32
@@ -412,11 +428,17 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                                       weight_decay=1e-4, eps=1e-8)
         model.optimizer = optimizer
 
+        # Cosine LR schedule — helps convergence especially for tasks 1+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=EPOCHS * len(train_loader), eta_min=1e-5
+        )
+
         train_single_task(
             model, train_loader, train_loader, optimizer, t_idx,
             device=device, epochs=EPOCHS,
             replay_buffer=replay_buf if t_idx > 0 else None,
             label_smoothing=0.05 if t_idx == 0 else 0.1,
+            scheduler=scheduler,
         )
 
         # ── Post-task: update replay buffer ────────────────────────────────────
