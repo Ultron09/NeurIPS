@@ -1,37 +1,42 @@
 import os
 import sys
 import torch
+# [V25.4] ABSOLUTE TRUTH: Disabling all JIT + Zero-Worker + Restored Routing
+_orig_compile = torch.compile
+torch.compile = lambda m, *args, **kwargs: m
+import torch._dynamo
+torch._dynamo.config.disable = True
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+torch.backends.cudnn.benchmark = False
+import faulthandler
+faulthandler.enable()
+os.environ["PYTHONFAULTHANDLER"] = "1"
+
 import torch.nn as nn
 import socket
 import subprocess
 import time
 import traceback
 import random
-import gc
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 import airborne_antara.moe as moe_mod
 from torchvision.models.resnet import ResNet, BasicBlock
+from torchvision import transforms
 
-# [V24.0] HYPER-FUSED: Re-implementing MoE for A100 Static Graphs
+# [V25.4] RESTORED STATIC MOE DISPATCHER
 if hasattr(moe_mod, 'SparseMoE'):
-    print("             [V24.0] Deploying Static MoE Dispatcher...")
+    print("             [V25.4] Deploying Fixed Static MoE Dispatcher...")
     def _unified_sparse_fwd(self, x, task_id=None, consciousness_state=None, *args, **kwargs):
         # 1. Static Routing Logic (Fused)
         logits = self.gate(x, consciousness_state=consciousness_state)
         if isinstance(logits, tuple): logits = logits[0]
         
-        # Stochastic path without graph breaks
-        explore_prob = 0.1 if self.training and self.num_experts > 1 else 0.0
-        explore_mask = (torch.rand(x.size(0), 1, device=x.device) < explore_prob)
-        
-        best_indices = torch.argmax(logits, dim=-1)
-        rand_indices = torch.randint(0, self.num_experts, (x.size(0),), device=x.device)
-        indices = torch.where(explore_mask.squeeze(), rand_indices, best_indices)
+        # [V25.4] CRITICAL: Hard argmax for static kernels
+        with torch.no_grad():
+            indices = torch.argmax(logits, dim=-1)
             
         # 2. Static Dispatch (No None checks, No mask.any breaks)
-        # We assume 100 classes for the classifier; dynamically fetch if needed.
         if not hasattr(self, '_v24_out_dim'):
-            # One-time probe
             with torch.no_grad():
                 test_out = self.experts[0](x[:1], task_id=task_id)
                 if isinstance(test_out, tuple): test_out = test_out[0]
@@ -40,11 +45,12 @@ if hasattr(moe_mod, 'SparseMoE'):
         outputs = None
         for i in range(self.num_experts):
             mask = (indices == i)
+            if not mask.any(): continue
+            
             expert_out = self.experts[i](x[mask], task_id=task_id)
             if isinstance(expert_out, tuple): expert_out = expert_out[0]
             
             if outputs is None:
-                # [V24.2] Precision-Sync: Use expert_out.dtype (Half/Float) to avoid Index put mismatch
                 outputs = torch.zeros(x.size(0), self._v24_out_dim, device=x.device, dtype=expert_out.dtype)
             
             outputs[mask] = expert_out
@@ -53,12 +59,9 @@ if hasattr(moe_mod, 'SparseMoE'):
 
     moe_mod.SparseMoE.forward = _unified_sparse_fwd
     torch._dynamo.config.capture_scalar_outputs = True
-    # [V24.1] TITAN STABILIZERS: Push past recompile limits
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
     torch._dynamo.config.recompile_limit = 64
     torch._dynamo.config.suppress_errors = True
-from torchvision import transforms
-from trainer import train_single_task
 
 # [V29] RESOURCE TELEMETRY UTILS
 try:
@@ -86,27 +89,16 @@ def get_resource_usage():
         metrics["ram_usage_gb"] = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
     return metrics
 
-# [V29] PATH INJECTION
 root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if root_path not in sys.path:
-    sys.path.append(root_path)
-    sys.path.append(os.path.join(root_path, "Phase_III_Metrics"))
-    sys.path.append(os.path.join(root_path, "Phase_I_Curriculum"))
+for p in [root_path, 
+          os.path.join(root_path, "Phase_III_Metrics"), 
+          os.path.join(root_path, "Phase_I_Curriculum"),
+          os.path.dirname(os.path.abspath(__file__))]:
+    if p not in sys.path:
+        sys.path.append(p)
 
 from trainer import train_single_task
 from dataset import SplitCIFAR100, SplitTinyImageNet
-
-def get_node_name():
-    return os.getenv("ANTARA_NODE", socket.gethostname())
-
-def git_sync_file(filepath, message="Result Sync"):
-    try:
-        subprocess.run(["git", "add", filepath], check=True)
-        subprocess.run(["git", "commit", "-m", message], check=True)
-        subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=True)
-        subprocess.run(["git", "push", "origin", "main"], check=True)
-    except Exception as e:
-        print(f"[GIT_WARN] Sync failed for {filepath}: {e}")
 
 class ContinualResNet(ResNet):
     def __init__(self, num_classes=100):
@@ -119,89 +111,56 @@ class ContinualResNet(ResNet):
 def model_factory(dataset_name, num_classes=100):
     return ContinualResNet(num_classes=num_classes)
 
-
 class ExternalReplayBuffer:
-    """[V30] Direct (x, y) tensor buffer for Class-IL replay.
-    Stores CLEAN (un-augmented) samples on CPU to avoid baking in
-    one specific random crop. Augmentation applied on-the-fly during sample()."""
     def __init__(self, per_task=1000, img_size=32):
         self.per_task = per_task
         self.img_size = img_size
-        self.x_data = []  # list of tensors, one per stored sample
-        self.y_data = []
+        self.x_data = []; self.y_data = []
         self._aug = transforms.Compose([
             transforms.RandomCrop(img_size, padding=4, padding_mode='reflect'),
             transforms.RandomHorizontalFlip(),
         ])
-        self._cache_x = None
-        self._cache_y = None
+        self._cache_x = None; self._cache_y = None
 
     def update_from_loader(self, dataset, indices, dataset_name="CIFAR100"):
-        """[V30.1] Store CLEAN samples by accessing the dataset with a simple transform.
-        This prevents 'baked-in' augmentation drift in the replay buffer."""
         import copy
         from torch.utils.data import DataLoader, Subset
-        
-        # Create a temporary subset with no augmentation
         clean_dataset = copy.copy(dataset)
         if hasattr(clean_dataset, 'transform'):
-            # Match normalization to dataset
-            if dataset_name == "CIFAR100":
-                norm = transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
-            else: # TinyImageNet
-                norm = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-                
-            clean_dataset.transform = transforms.Compose([
-                transforms.ToTensor(),
-                norm
-            ])
-            
+            if dataset_name == "CIFAR100": norm = transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+            else: norm = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+            clean_dataset.transform = transforms.Compose([transforms.ToTensor(), norm])
         clean_loader = DataLoader(Subset(clean_dataset, indices), batch_size=128, shuffle=False)
-        
         all_x, all_y = [], []
         for x, y in clean_loader:
-            all_x.append(x.cpu())
-            all_y.append(y.cpu())
-            
+            all_x.append(x.cpu()); all_y.append(y.cpu())
         if not all_x: return
-        
-        all_x = torch.cat(all_x)
-        all_y = torch.cat(all_y)
-        
+        all_x = torch.cat(all_x); all_y = torch.cat(all_y)
         sel_idx = torch.randperm(len(all_x))[:self.per_task]
-        self.x_data.append(all_x[sel_idx])
-        self.y_data.append(all_y[sel_idx])
-        self._cache_x = None # Invalidate cache
-        self._cache_y = None
+        self.x_data.append(all_x[sel_idx]); self.y_data.append(all_y[sel_idx])
+        self._cache_x = None; self._cache_y = None
 
     def __len__(self):
         return sum(x.size(0) for x in self.x_data)
 
     def sample(self, batch_size):
-        """Random sample across all stored tasks with on-the-fly augmentation."""
         if self._cache_x is None:
-            self._cache_x = torch.cat(self.x_data)
-            self._cache_y = torch.cat(self.y_data)
-        
+            self._cache_x = torch.cat(self.x_data); self._cache_y = torch.cat(self.y_data)
         indices = torch.randperm(len(self._cache_x))[:batch_size]
-        batch_x = self._cache_x[indices]
-        batch_x = self._aug(batch_x)
-        return batch_x, self._cache_y[indices]
-
+        return self._aug(self._cache_x[indices]), self._cache_y[indices]
 
 class ContinualTrainer:
     def __init__(self, model, device='cuda'):
         self.model = model; self.device = device
         self.optimizer = torch.optim.Adam(model.parameters(), lr=getattr(model.config, 'learning_rate', 5e-4))
     def train_task(self, loader, t_idx, epochs=10, replay_buffer=None):
-        # [V31.1] Explicitly purge old optimizer to free 4GB+ of momentum buffers
         if hasattr(self, 'optimizer'):
             del self.optimizer
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            gc.collect(); torch.cuda.empty_cache() if torch.cuda.is_available() else None
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=getattr(self.model.config, 'learning_rate', 5e-4))
-        return train_single_task(self.model, loader, loader, self.optimizer, t_idx, device=self.device, epochs=epochs, replay_buffer=replay_buffer)
+        res = train_single_task(self.model, loader, loader, self.optimizer, t_idx, device=self.device, epochs=epochs, replay_buffer=replay_buffer)
+        print(f"             [DEBUG] ContinualTrainer.train_task returning for Task {t_idx}.")
+        return res
 
 class ContinualEvaluator:
     def __init__(self, model, device='cuda'):
@@ -209,7 +168,7 @@ class ContinualEvaluator:
     def evaluate(self, loader, t_idx):
         self.model.eval()
         correct = 0; total = 0
-        with torch.inference_mode(): # Faster than no_grad for pure eval
+        with torch.inference_mode():
             for x, y in loader:
                 x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
                 logits = self.model.inference_step(x) if hasattr(self.model, 'inference_step') else self.model(x)
@@ -225,413 +184,159 @@ def get_stage_config(stage_id: int, dataset_name: str):
         "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
         "learning_rate": 1e-3, "use_gradient_centralization": True, "use_lookahead": True,
     }
-    if stage_id == -1: return AdaptiveFrameworkConfig(**base_params, memory_type='ewc', ewc_lambda=5000, use_moe=False)
-    if stage_id == -2: return AdaptiveFrameworkConfig(**base_params, memory_type='hybrid', use_prioritized_replay=True, dream_batch_size=32, enable_dreaming=True, dream_interval=5)
-    if stage_id == -4: return AdaptiveFrameworkConfig(**base_params, memory_type='orthogonal', use_moe=False)
-    if stage_id == 1: return AdaptiveFrameworkConfig(**base_params, use_moe=False, si_lambda=0.0)
-    if stage_id == 2: return AdaptiveFrameworkConfig(**base_params, use_moe=False, si_lambda=1.5)
-    if stage_id == 3: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_dreaming=True, dream_interval=5)
-    if stage_id == 4: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, enable_dreaming=True, dream_interval=5)
-    if stage_id == 5: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_dreaming=True, dream_interval=5)
-    if stage_id == 6: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.5, enable_consciousness=True, use_reptile=True, enable_world_model=True, enable_dreaming=True, dream_interval=5)
     if stage_id == 7: return AdaptiveFrameworkConfig(**base_params, use_moe=True, use_hierarchical_moe=True, si_lambda=1.0, use_ogd=True, novelty_z_threshold=1.2, adaptation_threshold=0.05, enable_consciousness=True, use_reptile=True, iron_mind_quota=0.35, use_learned_optimizer=False)
     return AdaptiveFrameworkConfig(**base_params)
 
 def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
-    node_name = get_node_name()
-    method_name = { -1: "EWC", -2: "DER++", -3: "LwF", -4: "RanPAC" }.get(stage_id, f"ANTARA_S{stage_id}")
-    
-    res_dir = os.path.join(os.getcwd(), "results")
-    os.makedirs(res_dir, exist_ok=True)
+    node_name = socket.gethostname()
+    res_dir = os.path.join(os.getcwd(), "results"); os.makedirs(res_dir, exist_ok=True)
     filename = f"SeqN_{node_name}_{seed}_{dataset_name}_{stage_id}.txt"
     filepath = os.path.join(res_dir, filename)
-    
-    if os.path.exists(filepath):
-        print(f"[SKIP] Result already exists: {filename}")
-        return
+    if os.path.exists(filepath): return
 
-    print(f"\n{'='*60}\nLAUNCHING: {method_name} | {dataset_name} | Seed: {seed}\n{'='*60}")
-    
-    import random
-    import numpy as np
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True  # Auto-tune convolutions for fixed input sizes
-
+    print(f"\n{'='*60}\nLAUNCHING: ANTARA_S{stage_id} | {dataset_name} | Seed: {seed}\n{'='*60}")
+    random.seed(seed); torch.manual_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     data_path = os.path.join(root_path, "data")
-    # [A100 TITAN SCALING] Batch Size 64 -> 256
     if dataset_name == "CIFAR100": curriculum = SplitCIFAR100(root=data_path, batch_size=256); num_classes = 100; num_tasks = 10
     else: curriculum = SplitTinyImageNet(root=data_path, batch_size=256); num_classes = 200; num_tasks = 10
     
     config = get_stage_config(stage_id, dataset_name)
-    # [V24.6] UNIFIED KERNEL: Disable internal compile to avoid nested JIT hangs
-    if hasattr(config, 'use_compile'): config.use_compile = False
-    
+    # [V25.13] INSTANCE LEVEL KILL: Ensure even bound methods are nullified
+    AdaptiveFramework._rebuild_restoration_cache = lambda self: None
     model = AdaptiveFramework(model_factory(dataset_name, num_classes=num_classes), config=config).to(device)
+    model.on_task_complete = lambda task_id: None 
+    print(f"             [DEBUG] Model device: {next(model.parameters()).device}")
     
-    # Run a dummy pass to trigger JIT compilation before the loop
-    with torch.amp.autocast('cuda'):
-        dummy_x = torch.randn(8, 3, 32, 32).to(device)
-        try:
-            _ = model(dummy_x)
-            print("             [TITAN] Kernel Pre-Heat Successful.")
-        except:
-            pass
-
+    print("             [DEBUG] Initializing Trainer...")
     trainer = ContinualTrainer(model, device=device); evaluator = ContinualEvaluator(model, device=device)
+    print("             [DEBUG] Trainer Ready.")
     
-    # =========================================================================
-    # [V22] ABSOLUTE ZERO PROTOCOL (Hard-Lock + Hyper-Plasticity)
-    # =========================================================================
-    import types
-    model.memory.param_id_to_mask = {}     
-    model.memory.task_omega_snapshots = {} 
+    # [V22] PATCHES
+    model.memory.param_id_to_mask = {}; model.memory.task_omega_snapshots = {} 
 
     def _v18_governor_patch(mem, task_id, backbone_ref):
-        # [V18.8] ABSOLUTE ZERO: Aggressive Quota for foundation
         total_quota = getattr(config, 'iron_mind_quota', 0.35)
-        # Force 10% for the first task to ensure a rock-solid foundation
         PER_TASK_QUOTA = 0.10 if task_id == 0 else (total_quota - 0.10) / (max(1, num_tasks - 1))
-        
-        MIN_IMPORTANCE = 1e-5 
-        id_to_p = {}; id_to_imp = {}
-        id_to_prefixed_name = {}
-        
+        id_to_p = {}; id_to_imp = {}; id_to_prefixed_name = {}
         with torch.no_grad():
             for m_idx, m_tracked in enumerate(mem.models):
                 prefix = f"m{m_idx}_"
                 for name, p in m_tracked.named_parameters():
                     if not p.requires_grad: continue
-                    p_id = id(p)
-                    id_to_p[p_id] = (name, p)
-                    
-                    # Use the CORRECT prefixed key for omega/fisher lookup
                     omega_key = prefix + name
-                    id_to_prefixed_name[p_id] = omega_key
-                    
+                    id_to_p[id(p)] = (name, p); id_to_prefixed_name[id(p)] = omega_key
                     curr = mem.omega.get(omega_key, torch.zeros_like(p).cpu()).clone().cpu()
-                    if hasattr(mem, 'fisher_dict') and omega_key in mem.fisher_dict:
-                        curr = curr + mem.fisher_dict[omega_key].clone().cpu()
-                    id_to_imp[p_id] = curr
-        
+                    if hasattr(mem, 'fisher_dict') and omega_key in mem.fisher_dict: curr += mem.fisher_dict[omega_key].clone().cpu()
+                    id_to_imp[id(p)] = curr
         if not id_to_imp: return
         mem.task_omega_snapshots[task_id] = {pid: imp.clone() for pid, imp in id_to_imp.items()}
-        
-        # Recalculate Union of top-8% across all tasks seen so far
         cumulative = {}
-        for tid, snap in mem.task_omega_snapshots.items():
-            flat = torch.cat([v.view(-1) for v in snap.values()])
-            n = flat.numel()
-            k = max(1, min(int((1.0 - PER_TASK_QUOTA) * n), n - 1))
-            thr = max(torch.kthvalue(flat, k).values.item(), MIN_IMPORTANCE)
+        device = next(backbone_ref.parameters()).device
+        for snap in mem.task_omega_snapshots.values():
+            thr = 1e-4 # [V25.9] Fixed Absolute Threshold for Stability
             for pid, imp in snap.items():
-                m = (imp >= thr).bool().cpu()
-                # [V18.4] ETERNAL SOUL: Force Router/Gate parameters into the sacred mask
-                p_name = id_to_prefixed_name.get(pid, "").lower()
-                if "gate" in p_name or "router" in p_name:
-                    m = torch.ones_like(m).bool()
+                m = (imp.to(device) >= thr).bool().cpu()
+                if "gate" in id_to_prefixed_name.get(pid, "").lower(): m = torch.ones_like(m).bool()
                 cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
-        
-        # Apply the final union mask
         for pid, mask in cumulative.items():
             if pid not in id_to_p: continue
-            name, tensor = id_to_p[pid]
-            mem.param_id_to_mask[pid] = mask.to(tensor.device)
-            # Write sacred_mask with the PREFIXED key the package expects
-            if pid in id_to_prefixed_name:
-                mem.sacred_mask[id_to_prefixed_name[pid]] = mask.to(tensor.device)
-        
-        mem.saturation_level = (sum(m.sum() for m in cumulative.values()) / sum(m.numel() for m in cumulative.values())).item()
-        print(f"             [TITAN] Hard-Lock Active. Saturation: {mem.saturation_level:.2%}")
+            mem.param_id_to_mask[pid] = mask.to(id_to_p[pid][1].device)
+            mem.sacred_mask[id_to_prefixed_name[pid]] = mask.to(id_to_p[pid][1].device)
+        print(f"             [TITAN] Hard-Lock Active. Saturation: {sum(m.sum() for m in cumulative.values())/sum(m.numel() for m in cumulative.values()):.2%}")
 
-    # Redirect both the governor and the internal memory update
     model.governor.update_sacred_mask = _v18_governor_patch
     model.memory._v18_update = _v18_governor_patch
-
-    
-    # NOTE: Gradient hooks REMOVED — the package's CAS (1200 Gradient Shunts)
-    # already protects sacred parameters. Adding our own hooks on top was
-    # causing double-protection, killing plasticity and blocking positive
-    # backward transfer that was seen in the "golden" runs.
-
-    # ==================== BINARY PROTECTION (V18 IRON SOUL) ====================
-    # Philosophy: Sacred 8% = HARD FROZEN (CAS + Restoration).
-    #             Non-sacred 92% = 100% PLASTIC. No half-measures.
-    #
-    # Kill Layer 2: SI/EWC penalty loss (was dragging ALL 93.8M params to anchors)
     model.memory.compute_penalty = lambda *a, **k: torch.tensor(0.0, device=device)
-    
-    # Kill Layer 4: LR Gating (was scaling gradients to 20% on low-surprise data)
-    # We force "high surprise" so the gate stays at 1.0 (full gradient flow).
-    if model.world_model:
-        _original_compute_surprise = model.world_model.compute_surprise
-        def _full_plasticity_surprise(z_pred, z_actual):
-            # Return surprise=4.0 → lr_gate = min(1.0, 4.0/4.0) = 1.0
-            # Keep actual WM loss for logging but don't let it gate learning
-            _, wm_loss = _original_compute_surprise(z_pred, z_actual)
-            return torch.tensor(4.0, device=z_pred.device), wm_loss
-        model.world_model.compute_surprise = _full_plasticity_surprise
-    
-    # Kill Layer 5: Surgical weight decay on non-sacred params
-    model._compute_surgical_weight_decay = lambda *a, **k: torch.tensor(0.0, device=device)
-    
-    # [V18.4] ETERNAL SOUL: Stabilize MoE Routing
-    # Force the MoE temperature to stay soft (floor at 0.75) to prevent Routing Collapse.
-    if hasattr(model, 'meta_controller'):
-        _orig_on_task = model.on_task_complete
-        def _v18_eternal_on_task(self, task_id):
-            _orig_on_task(task_id)
-            if hasattr(self.meta_controller, 'temp'):
-                self.meta_controller.temp = max(0.75, self.meta_controller.temp)
-                print(f"             [V18.4_STABILITY] MoE Temperature stabilized at {self.meta_controller.temp:.4f}")
-        model.on_task_complete = types.MethodType(_v18_eternal_on_task, model)
-
-    # [V18.9.2] CLEAN SINGULARITY: Dual-Rate Gradient Engine
-    # We remove the manual scaler to avoid conflict with the framework's native AMP.
-    
-    # 1. Freeze Router Temperature at 1.0 (Neutral/Stable)
-    if hasattr(model, 'meta_controller'):
-        model.meta_controller.temp = 1.0
-        if hasattr(model.meta_controller, 'sharpen_temperature'):
-            model.meta_controller.sharpen_temperature = lambda *a, **k: None
-            print("             [V18.8_LOCK] MoE Temperature physically locked at 1.0")
     
     @torch._dynamo.disable
     def _v18_pre_warm_protection_map(self):
-        """[V24.0] Flattened Gradient Engine for A100 Speed."""
         experts = getattr(self.memory, 'models', [])
-        num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
-        
-        print("             [V24.0] Flattening Gradient Engine for Warp Speed...")
-        self.memory._v18_grad_multipliers = {}
-        self.memory._v24_flat_grad_logic = [] # (Parameter, MultiplierTensor, AnchorTensor)
+        num_experts = len(experts) if experts else 1
+        self.memory._v24_flat_grad_logic = []
         self.memory._v18_sacred_bns = []
-        
         with torch.no_grad():
             for name, p in self.model.named_parameters():
-                combined_mask = torch.zeros_like(p, dtype=torch.bool)
-                found = False
-                for exp_idx in range(max(1, num_experts)):
+                mask = torch.zeros_like(p, dtype=torch.bool); found = False
+                for exp_idx in range(num_experts):
                     key = f"m{exp_idx}_{name}"
-                    if key in self.memory.sacred_mask:
-                        combined_mask |= self.memory.sacred_mask[key].to(p.device)
-                        found = True
-                
-                mult = torch.where(combined_mask, 0.0, 1.2).to(p.device) if found else torch.full_like(p, 1.2)
-                anc = self.memory.anchor.get(name, p.data.clone()).to(p.device)
-                
-                self.memory._v18_grad_multipliers[name] = mult
-                self.memory._v24_flat_grad_logic.append((p, mult, anc, combined_mask))
-
-            for m_name, m in self.model.named_modules():
-                if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
-                    is_sacred = False
-                    for exp_idx in range(max(1, num_experts)):
-                        if f"m{exp_idx}_{m_name}.weight" in self.memory.sacred_mask:
-                            is_sacred = True; break
-                    if is_sacred: self.memory._v18_sacred_bns.append(m)
+                    if key in self.memory.sacred_mask: mask |= self.memory.sacred_mask[key].to(p.device); found = True
+                mult = torch.where(mask, 0.0, 1.2).to(p.device) if found else torch.full_like(p, 1.2)
+                self.memory._v24_flat_grad_logic.append((p, mult, self.memory.anchor.get(name, p.data.clone()).to(p.device), mask))
+            for n, m in self.model.named_modules():
+                if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                    if any(f"m{i}_{n}.weight" in self.memory.sacred_mask for i in range(num_experts)): self.memory._v18_sacred_bns.append(m)
         self.memory._v18_cache_id = len(self.memory.sacred_mask)
 
     model.pre_warm_protection_map = types.MethodType(_v18_pre_warm_protection_map, model)
-
-    _original_train_step = model.train_step
+    _orig_train_step = model.train_step
     def _v18_absolute_zero_train_step(self, x, target_data=None, **kwargs):
-        # [V18.11] Re-warm only if cache is stale
-        if not hasattr(self.memory, '_v18_grad_multipliers') or self.memory._v18_cache_id != len(self.memory.sacred_mask):
-            self.pre_warm_protection_map()
-
-        # 2. Apply BN Cryostasis
+        if not hasattr(self.memory, '_v24_flat_grad_logic') or self.memory._v18_cache_id != len(self.memory.sacred_mask): self.pre_warm_protection_map()
         for m in self.memory._v18_sacred_bns: m.eval()
-        
-        # Step: Forward & Backward
-        res = _original_train_step(x, target_data=target_data, **kwargs)
-        
-        # 3. FAST FLAT-GRAD ENGINE (V24.0 HYPER-FUSED)
+        res = _orig_train_step(x, target_data=target_data, **kwargs)
         with torch.no_grad():
-            is_plastic_task = getattr(self, 'current_task', 0) > 0
+            is_plastic = getattr(self, 'current_task', 0) > 0
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            
             for p, mult, anc, mask in self.memory._v24_flat_grad_logic:
                 if p.grad is not None:
-                    if is_plastic_task:
-                        # Absolute Zero Hard-Lock
-                        p.grad.data.masked_fill_(mask, 0.0)
-                        p.data.copy_(torch.where(mask, anc, p.data))
-                        # Hyper-Plasticity Boost
-                        p.grad.data.mul_(4.0)
-                    else:
-                        p.grad.data.mul_(mult)
-
+                    if is_plastic: p.grad.data.masked_fill_(mask, 0.0); p.data.copy_(torch.where(mask, anc, p.data)); p.grad.data.mul_(4.0)
+                    else: p.grad.data.mul_(mult)
         for m in self.memory._v18_sacred_bns: m.train()
+        import sys
+        sys.stderr.write(".")
+        sys.stderr.flush()
         return res
-    
     model.train_step = types.MethodType(_v18_absolute_zero_train_step, model)
-    print("             [V18.9.2_CLEAN] Dual-Rate Engine Enabled (Sync with Native AMP).")
-    # ===========================================================================
 
-    if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
-        def _patched_reptile(self_rep):
-            # [V18.9] Meta-Learning Acceleration: Boost meta-update for plasticity
-            tgt = self_rep.model; cw = tgt.state_dict(); eps = self_rep.config.reptile_learning_rate * 1.5
-            with torch.no_grad():
-                for name, anc in self_rep.anchor_weights.items():
-                    if name not in cw: continue
-                    fast = cw[name]
-                    if anc.is_floating_point():
-                        tv = anc + eps * (fast - anc)
-                        mask = model.memory.sacred_mask.get(name)
-                        if mask is not None: cw[name].copy_(torch.where(mask.to(fast.device), anc.to(fast.device), tv.to(fast.device)))
-                        else: cw[name].copy_(tv)
-                    else: cw[name].copy_(fast)
-            self_rep.anchor_weights = self_rep._clone_weights()
-        model.meta_controller.reptile._perform_update = types.MethodType(_patched_reptile, model.meta_controller.reptile)
-    # =========================================================================
-
-    # [V24.6] UNIFIED KERNEL: Single final compilation pass for A100
-    print("             [TITAN] Pre-heating Unified Cognitive Kernel (max-autotune)...")
-    torch._dynamo.config.optimize_ddp = False 
-    model = torch.compile(model, mode="max-autotune")
-
-    
-    results = []
-    start_time = time.time()
-    torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
-
-    initial_accuracies = []
-    final_accuracies = []
-    test_loaders = []
-    img_size = 64 if dataset_name == "TinyImageNet" else 32
-    replay_buf = ExternalReplayBuffer(per_task=1000, img_size=img_size)
+    results = []; start_time = time.time(); test_loaders = []
+    replay_buf = ExternalReplayBuffer(per_task=1000, img_size=64 if dataset_name == "TinyImageNet" else 32)
 
     for t_idx in range(num_tasks):
         train_loader, _, test_loader = curriculum.get_task(t_idx)
         test_loaders.append(test_loader)
-        # [V18.7] SPEED: Task 0 needs 10 epochs for foundation, others can thrive on 7
-        n_epochs = 10 if t_idx == 0 else 7
-        # Optimize DataLoader for speed
-        # [A100 TITAN SCALING] 4 -> 8 Workers | 2 -> 4 Prefetch
-        train_loader.num_workers = 8
-        train_loader.pin_memory = True
-        train_loader.prefetch_factor = 4 
-        # [V19.1] UNIFIED 8-EPOCH REGIME
-        n_epochs = 8 
-        # [V21.2] PRE-WARM PROTECTION MAP: Avoid Inductor Hangs
+        train_loader.num_workers = 0; train_loader.pin_memory = True; train_loader.prefetch_factor = None
+        
+        print("             [DEBUG] Pre-warming Protection Map...")
         model.pre_warm_protection_map()
+        print(f"\n[WARRIOR] Starting Task {t_idx} | Epochs: 8")
         
-        print(f"\n[WARRIOR] Starting Task {t_idx} | Regime: {'FOUNDATION' if t_idx==0 else 'HYPER-PLASTIC'} | Epochs: {n_epochs}")
-        
-        # [V20.1] MOMENTUM PURGE & ROUTER ANCHORING
         if t_idx > 0:
-            # 1. Purge Optimizer Momentum for Sacred Weights
             with torch.no_grad():
                 for name, p in model.named_parameters():
                     if name in model.memory.sacred_mask and model.memory.sacred_mask[name].any():
-                        state = trainer.optimizer.state[p]
-                        if 'momentum_buffer' in state: state['momentum_buffer'].zero_()
-                        if 'exp_avg' in state: state['exp_avg'].zero_()
-                        if 'exp_avg_sq' in state: state['exp_avg_sq'].zero_()
-            
-            # 2. Anchor Task 0 Router (Hard-wire Expert 0 for foundation confidence)
-            if hasattr(model, 'meta_controller') and hasattr(model.meta_controller, 'router'):
-                 # We don't hard-code Task-IL, we just bias the Expert 0 weights to be stable
-                 print("             [V20.1] Anchoring Router for Foundation Stability...")
+                        for k in ['momentum_buffer', 'exp_avg', 'exp_avg_sq']:
+                            if k in trainer.optimizer.state[p]: trainer.optimizer.state[p][k].zero_()
+            trainer.train_task = lambda loader, task_id, epochs, replay_buffer=None: train_single_task(trainer.model, loader, loader, trainer.optimizer, task_id, device=trainer.device, epochs=epochs, replay_buffer=replay_buffer, label_smoothing=0.1)
 
-            original_train_single = trainer.train_task
-            def _v20_berserker_train(loader, task_id, epochs, replay_buffer=None):
-                return train_single_task(trainer.model, loader, loader, trainer.optimizer, task_id, 
-                                       device=trainer.device, epochs=epochs, replay_buffer=replay_buffer,
-                                       enable_dream=False, meta_step=False, label_smoothing=0.1) 
-            trainer.train_task = _v20_berserker_train
+        trainer.train_task(train_loader, t_idx, epochs=8, replay_buffer=replay_buf if t_idx > 0 else None)
+        print("             [DEBUG] Training Task Complete. Updating Replay Buffer...", flush=True)
+        replay_buf.update_from_loader(train_loader.dataset.dataset, train_loader.dataset.indices, dataset_name=dataset_name)
+        
+        print("             [DEBUG] Replay Buffer Updated. Anchoring Parameters...", flush=True)
+        # [V25.12] Manual Anchoring only — bypasses library's unstable on_task_complete
+        with torch.no_grad():
+            for m_tr in model.memory.models:
+                for n, p in m_tr.named_parameters():
+                    if p.requires_grad: model.memory.anchor[n] = p.data.clone().detach().cpu()
+        
+        print("             [DEBUG] Parameters Anchored. Patching Governor...", flush=True)
+        _v18_governor_patch(model.memory, t_idx, model.memory.models[0])
 
-        trainer.train_task(train_loader, t_idx, epochs=n_epochs, replay_buffer=replay_buf if t_idx > 0 else None)
-        
-        # [V30.1] Store CLEAN exemplars BEFORE consolidation
-        train_indices = train_loader.dataset.indices
-        base_dataset = train_loader.dataset.dataset
-        replay_buf.update_from_loader(base_dataset, train_indices, dataset_name=dataset_name)
-        print(f"             [REPLAY] Buffer: {len(replay_buf)} clean exemplars.")
-        
-        # [V29] CRITICAL: Signal end-of-task to framework.
-        # on_task_complete populates omega/fisher values via consolidation.
-        if hasattr(model, 'on_task_complete'):
-            # Temporarily restore original governor so on_task_complete doesn't crash
-            # (the package's internal call runs before omega is ready anyway)
-            original_update = model.governor.update_sacred_mask
-            model.governor.update_sacred_mask = lambda *a, **kw: None  # No-op during package consolidation
-            model.on_task_complete(t_idx)
-            model.governor.update_sacred_mask = original_update  # Restore V18
-            
-            # Re-sync SI anchor to prevent drift after consolidation
-            with torch.no_grad():
-                for m_tracked in model.memory.models:
-                    for name, p in m_tracked.named_parameters():
-                        if p.requires_grad: model.memory.anchor[name] = p.data.clone().detach().cpu()
-            
-            # NOW run V18 anchoring — omega/fisher are fully populated
-            _v18_governor_patch(model.memory, t_idx, model.memory.models[0])
-            print(f"             [IRON_MIND] Task {t_idx} knowledge anchored via V18 patch.")
+        print("             [DEBUG] Governor Patched. Evaluating Performance...", flush=True)
+        task_accs = [evaluator.evaluate(l, i) for i, l in enumerate(test_loaders)]
+        print(f"             [LIVE] Avg Accuracy: {sum(task_accs)/len(task_accs):.2%}", flush=True)
+        torch.cuda.empty_cache(); gc.collect()
+        print("             [DEBUG] Task Transition Complete.", flush=True)
 
-        
-        # Capture Task Accuracies
-        task_accuracies = [evaluator.evaluate(loader, i) for i, loader in enumerate(test_loaders)]
-        initial_accuracies.append(task_accuracies[t_idx]) 
-        
-        avg_acc = sum(task_accuracies) / len(task_accuracies)
-        acc_str = ", ".join([f"T{i}: {acc:.2%}" for i, acc in enumerate(task_accuracies)])
-        
-        usage = get_resource_usage()
-        # [LIVE_DEBUG] Telemetry and Memory Cleanup
-        print(f"\n             [V18.7_SPEED] Task {t_idx} Finished in {(time.time() - start_time)/60:.1f}m total.")
-        torch.cuda.empty_cache()
-        import gc; gc.collect()
-        
-        print(f"\n[LIVE_DEBUG] Task {t_idx} Finished | Average Accuracy: {avg_acc:.2%}")
-        print(f"             Accuracies: [{acc_str}]")
-        print(f"             Resource: VRAM {usage['vram_peak_gb']:.2f}GB | Power {usage['avg_power_w']:.1f}W")
-        results.append(avg_acc)
-        
-        if t_idx == num_tasks - 1:
-            final_accuracies = task_accuracies
-
-    total_time = time.time() - start_time
-    usage = get_resource_usage()
-    
-    # CALCULATE RIGOROUS BWT
-    forgetting = [final_accuracies[i] - initial_accuracies[i] for i in range(num_tasks - 1)]
-    bwt = sum(forgetting) / len(forgetting) if len(forgetting) > 0 else 0.0
-    final_avg = results[-1]
-    
-    report = (
-        f"Result File: {filename}\n"
-        f"Method: {method_name} | Dataset: {dataset_name} | Seed: {seed} | Node: {node_name}\n"
-        f"Avg Accuracy: {final_avg:.4f}\n"
-        f"BWT: {bwt:.4f}\n"
-        f"Wall-clock: {total_time/60:.2f} mins\n"
-        f"Peak VRAM: {usage['vram_peak_gb']:.2f} GB\n"
-        f"Mean Power: {usage['avg_power_w']:.1f} W\n"
-    )
-    
+    report = f"Method: ANTARA_S{stage_id} | Seed: {seed}\nAvg Accuracy: {sum(task_accs)/len(task_accs):.4f}\n"
     with open(filepath, "w") as f: f.write(report)
-    print(f"[SUCCESS] Saved to {filepath}")
-    git_sync_file(filepath, f"AutoSync: {filename}")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--stages", type=int, nargs="+", required=True)
-    parser.add_argument("--datasets", type=str, nargs="+", default=["CIFAR100", "TinyImageNet"])
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 10, 20, 30])
     args = parser.parse_args()
-    
     for stage in args.stages:
-        for ds in args.datasets:
-            for seed in args.seeds:
-                try:
-                    run_experiment(dataset_name=ds, stage_id=stage, seed=seed)
-                except Exception as e:
-                    print(f"\n[CRITICAL_FAIL] {ds} S{stage} Seed {seed} failed. Moving to next run.")
-                    print(traceback.format_exc())
-                    continue
+        for seed in args.seeds:
+            run_experiment(stage_id=stage, seed=seed)

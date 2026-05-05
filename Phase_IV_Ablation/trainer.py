@@ -19,7 +19,7 @@ def mixup_data(x, y, alpha=0.4):
 def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device='cuda',
                       ewc_module=None, agem_module=None, replay_buffer=None,
                       der_module=None, hat_module=None,
-                      epochs=10, patience=3, mixup_alpha=0.4):
+                      epochs=10, patience=3, mixup_alpha=0.4, label_smoothing=0.0):
     """
     Unified training logic with Cognitive Bifurcation:
     - ANTARA path: delegates entirely to model.train_step() (full cognitive loop)
@@ -38,11 +38,11 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
     seen_classes = (t_idx + 1) * classes_per_task
     is_antara = hasattr(model, 'train_step') and hasattr(model, 'consolidate_memory')
 
-    for epoch in range(epochs):
-        model.train()
-        train_iter = tqdm(train_loader, desc=f"Task {t_idx} Epoch {epoch}")
-
-        for x, y in train_iter:
+    try:
+        for epoch in range(epochs):
+            model.train()
+            print(f"Task {t_idx} Epoch {epoch} started...")
+        for x, y in train_loader:
             start_time = time.time()
             x, y = x.to(device), y.to(device)
 
@@ -88,64 +88,72 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                         logits = model.fc(masked_features)
                     else:
                         logits = model(x_mix.float())
-                    loss = lam * F.cross_entropy(logits[:, :seen_classes], y_a) + \
-                           (1 - lam) * F.cross_entropy(logits[:, :seen_classes], y_b)
+                    loss = lam * F.cross_entropy(logits[:, :seen_classes], y_a, label_smoothing=label_smoothing) + \
+                           (1 - lam) * F.cross_entropy(logits[:, :seen_classes], y_b, label_smoothing=label_smoothing)
                 else:
                     if hat_module:
                         x_f = model.conv1(x); x_f = model.bn1(x_f); x_f = model.relu(x_f); x_f = model.maxpool(x_f)
-                        x_f = model.layer1(x_f); x_f = model.layer2(x_f); x_f = model.layer3(x_f)
-                        x_f = model.layer4(x_f); x_f = model.avgpool(x_f)
-                        features = torch.flatten(x_f, 1)
-                        masked_features = hat_module.apply_mask(features, t_idx)
-                        logits = model.fc(masked_features)
+                    if hat_module:
+                        logits = model(x.float(), t_idx)
+                        loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
                     else:
                         logits = model(x.float())
-                    loss = F.cross_entropy(logits[:, :seen_classes], y)
+                        loss = F.cross_entropy(logits[:, :seen_classes], y, label_smoothing=label_smoothing)
 
-                if hat_module:
-                    loss += 0.75 * hat_module.reg_loss(t_idx)
+                    if hat_module:
+                        loss += 0.75 * hat_module.reg_loss(t_idx)
 
-                if replay_buffer:
-                    rx, ry = replay_buffer.get_batch(32)
-                    if rx is not None:
-                        r_logits = model(rx.to(device))
-                        loss += F.cross_entropy(r_logits[:, :seen_classes], ry.to(device))
+                    if replay_buffer:
+                        rx, ry = replay_buffer.get_batch(32)
+                        if rx is not None:
+                            r_logits = model(rx.to(device))
+                            loss += F.cross_entropy(r_logits[:, :seen_classes], ry.to(device), label_smoothing=label_smoothing)
 
-                if der_module:
-                    loss += der_module.get_loss(x, y, logits, device=device)
+                    if der_module:
+                        loss += der_module.get_loss(x, y, logits, device=device)
 
-                if ewc_module:
-                    loss += ewc_module.penalty()
-                
-                loss.backward()
+                    if ewc_module:
+                        loss += ewc_module.penalty()
+                    
+                    loss.backward()
 
-                if agem_module and ref_grad is not None:
-                    curr_grad = []
-                    for p in model.parameters():
-                        if p.grad is not None: curr_grad.append(p.grad.view(-1))
-                        else: curr_grad.append(torch.zeros(p.numel(), device=device))
-                    curr_grad = torch.cat(curr_grad)
-                    projected = agem_module.project(curr_grad, ref_grad)
-                    pointer = 0
-                    for p in model.parameters():
-                        p.grad = projected[pointer:pointer + p.numel()].view_as(p).clone()
-                        pointer += p.numel()
+                    if agem_module:
+                        ref_grad = agem_module.get_ref_grad(device=device)
+                        if ref_grad is not None:
+                            curr_grad = []
+                            for p in model.parameters():
+                                if p.grad is not None: curr_grad.append(p.grad.view(-1))
+                                else: curr_grad.append(torch.zeros(p.numel(), device=device))
+                            curr_grad = torch.cat(curr_grad)
+                            projected = agem_module.project(curr_grad, ref_grad)
+                            pointer = 0
+                            for p in model.parameters():
+                                p.grad = projected[pointer:pointer + p.numel()].view_as(p).clone()
+                                pointer += p.numel()
 
-                if hat_module:
-                    hat_module.mask_gradients(model)
+                    if hat_module:
+                        hat_module.mask_gradients(model)
 
-                optimizer.step()
+                    optimizer.step()
 
-                if agem_module: agem_module.buffer.update(x, y)
-                if replay_buffer: replay_buffer.update(x, y)
-                if der_module: der_module.update(x, y, logits.detach())
+                    if agem_module: agem_module.buffer.update(x, y)
+                    if replay_buffer:
+                        if hasattr(replay_buffer, 'update'):
+                            replay_buffer.update(x, y)
+                    if der_module: der_module.update(x, y, logits.detach())
 
-                step_loss = loss.item()
+                total_step_time += (time.time() - start_time) * 1000
+                total_steps += 1
+            print(f"\n             [DEBUG] Task {t_idx} Epoch {epoch} completed.", flush=True)
 
-            total_step_time += (time.time() - start_time) * 1000
-            total_steps += 1
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] Training loop failed: {str(e)}", flush=True)
+        import traceback
+        traceback.print_exc()
+        raise e
 
     avg_step_time = total_step_time / total_steps if total_steps > 0 else 0
+    print(f"             [DEBUG] train_single_task for Task {t_idx} returning.", flush=True)
     return avg_step_time
 
 def validate(model, loader, seen_classes, device, is_antara=False, hat_module=None, t_idx=0):
