@@ -235,11 +235,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     model.memory.task_omega_snapshots = {} 
 
     def _v18_governor_patch(mem, task_id, backbone_ref):
-        # [V18.5] FLUID SOUL: Dynamically calculate quota from the local experiment scope
+        # [V18.8] ABSOLUTE ZERO: Aggressive Quota for foundation
         total_quota = getattr(config, 'iron_mind_quota', 0.35)
-        # Use 8% if possible, but stay within the global limit per task
-        # num_tasks is available from line 218/219
-        PER_TASK_QUOTA = min(0.08, total_quota / max(1, num_tasks))
+        # Force 10% for the first task to ensure a rock-solid foundation
+        PER_TASK_QUOTA = 0.10 if task_id == 0 else (total_quota - 0.10) / (max(1, num_tasks - 1))
         
         MIN_IMPORTANCE = 1e-5 
         id_to_p = {}; id_to_imp = {}
@@ -336,15 +335,22 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
                 print(f"             [V18.4_STABILITY] MoE Temperature stabilized at {self.meta_controller.temp:.4f}")
         model.on_task_complete = types.MethodType(_v18_eternal_on_task, model)
 
-    # [V18.6] SINGULARITY: Speed (AMP) + Stability (Logit Isolation)
+    # [V18.8] ABSOLUTE ZERO: Physical Gradient Shunt + Temperature Lock
     from torch.cuda.amp import autocast, GradScaler
     model.scaler = GradScaler()
     
+    # 1. Freeze Router Temperature at 1.0 (Neutral/Stable)
+    if hasattr(model, 'meta_controller'):
+        model.meta_controller.temp = 1.0
+        # Patch the temperature sharpen method to DO NOTHING
+        if hasattr(model.meta_controller, 'sharpen_temperature'):
+            model.meta_controller.sharpen_temperature = lambda *a, **k: None
+            print("             [V18.8_LOCK] MoE Temperature physically locked at 1.0")
+
     _original_train_step = model.train_step
-    def _v18_singularity_train_step(self, x, target_data=None, **kwargs):
-        # Enable Mixed Precision for speed
+    def _v18_absolute_zero_train_step(self, x, target_data=None, **kwargs):
         with autocast():
-            # [V18.3] ZENITH BN CRYOSTASIS logic integrated
+            # Apply BN Cryostasis
             sacred_modules = []
             if hasattr(self.memory, 'sacred_mask'):
                 experts = getattr(self.memory, 'models', [])
@@ -353,24 +359,31 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
                     if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
                         is_sacred = False
                         for exp_idx in range(max(1, num_experts)):
-                            unique_name_prefix = f"m{exp_idx}_{m_name}"
-                            for p_name, _ in m.named_parameters(recurse=False):
-                                full_name = f"{unique_name_prefix}.{p_name}"
-                                if full_name in self.memory.sacred_mask and self.memory.sacred_mask[full_name].any():
-                                    is_sacred = True; break
-                            if is_sacred: break
-                        if is_sacred:
-                            m.eval(); sacred_modules.append(m)
+                            if f"m{exp_idx}_{m_name}.weight" in self.memory.sacred_mask:
+                                is_sacred = True; break
+                        if is_sacred: m.eval(); sacred_modules.append(m)
             
+            # Step 1: Forward & Backward
             res = _original_train_step(x, target_data=target_data, **kwargs)
             
-            # Post-step restoration
+            # Step 2: PHYSICAL GRADIENT DELETION (The Shunt)
+            # This makes it impossible for the optimizer to update sacred weights.
+            if hasattr(self.memory, 'sacred_mask'):
+                for name, p in self.model.named_parameters():
+                    # Expert-aware key check
+                    for exp_idx in range(max(1, num_experts)):
+                        key = f"m{exp_idx}_{name}"
+                        if key in self.memory.sacred_mask:
+                            mask = self.memory.sacred_mask[key]
+                            if p.grad is not None:
+                                p.grad.data.mul_( (~mask).to(p.grad.dtype).to(p.grad.device) )
+
+            # Post-step BN restore
             for m in sacred_modules: m.train()
             return res
     
-    model.train_step = types.MethodType(_v18_singularity_train_step, model)
-    
-    print("             [V18.6_SINGULARITY] AMP Hyper-Drive & Zenith BN Lock Active.")
+    model.train_step = types.MethodType(_v18_absolute_zero_train_step, model)
+    print("             [V18.8_SINGULARITY] Absolute Zero Protection Enabled.")
     # ===========================================================================
 
     if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
