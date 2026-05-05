@@ -25,45 +25,47 @@ import airborne_antara.moe as moe_mod
 from torchvision.models.resnet import ResNet, BasicBlock
 from torchvision import transforms
 
-# [V25.4] RESTORED STATIC MOE DISPATCHER
+# [NeurIPS] CORRECT WEIGHTED MOE DISPATCHER — replaces the broken hard-argmax patch
+# The original SparseMoE.forward does weighted combination of top-k experts.
+# The hard-argmax version was discarding the gating weights entirely.
 if hasattr(moe_mod, 'SparseMoE'):
-    print("             [V25.4] Deploying Fixed Static MoE Dispatcher...")
-    def _unified_sparse_fwd(self, x, task_id=None, consciousness_state=None, *args, **kwargs):
-        # 1. Static Routing Logic (Fused)
-        logits = self.gate(x, consciousness_state=consciousness_state)
-        if isinstance(logits, tuple): logits = logits[0]
-        
-        # [V25.4] CRITICAL: Hard argmax for static kernels
-        with torch.no_grad():
-            indices = torch.argmax(logits, dim=-1)
-            
-        # 2. Static Dispatch (No None checks, No mask.any breaks)
+    print("             [NeurIPS] Deploying Weighted MoE Dispatcher (top-k weighted sum)...")
+    def _weighted_sparse_fwd(self, x, task_id=None, consciousness_state=None, *args, **kwargs):
+        # 1. Gating — returns (weights [B, top_k], indices [B, top_k])
+        gate_out = self.gate(x, task_id=task_id, consciousness_state=consciousness_state)
+        if isinstance(gate_out, tuple):
+            weights, indices = gate_out
+        else:
+            # Fallback: treat as logits, compute softmax top-k
+            logits = gate_out
+            top_k_logits, indices = torch.topk(logits, self.top_k, dim=1)
+            weights = torch.softmax(top_k_logits, dim=1)
+
+        # Cache output dim for efficiency
         if not hasattr(self, '_v24_out_dim'):
             with torch.no_grad():
                 test_out = self.experts[0](x[:1], task_id=task_id)
                 if isinstance(test_out, tuple): test_out = test_out[0]
                 self._v24_out_dim = test_out.shape[1]
-        
-        outputs = None
-        for i in range(self.num_experts):
-            mask = (indices == i)
-            if not mask.any(): continue
-            
-            expert_out = self.experts[i](x[mask], task_id=task_id)
-            if isinstance(expert_out, tuple): expert_out = expert_out[0]
-            
-            if outputs is None:
-                outputs = torch.zeros(x.size(0), self._v24_out_dim, device=x.device, dtype=expert_out.dtype)
-            
-            outputs[mask] = expert_out
-            
-        return outputs, indices
 
-    moe_mod.SparseMoE.forward = _unified_sparse_fwd
-    torch._dynamo.config.capture_scalar_outputs = True
-    torch._dynamo.config.allow_unspec_int_on_nn_module = True
-    torch._dynamo.config.recompile_limit = 64
-    torch._dynamo.config.suppress_errors = True
+        batch_size = x.size(0)
+        final_output = torch.zeros(batch_size, self._v24_out_dim, device=x.device, dtype=x.dtype)
+
+        # 2. Weighted dispatch — each sample gets a weighted sum of its top-k experts
+        for k_pos in range(self.top_k):
+            expert_idx_per_sample = indices[:, k_pos]  # [B]
+            w = weights[:, k_pos]                       # [B]
+            for i in range(self.num_experts):
+                mask = (expert_idx_per_sample == i)
+                if not mask.any(): continue
+                expert_out = self.experts[i](x[mask], task_id=task_id)
+                if isinstance(expert_out, tuple): expert_out = expert_out[0]
+                # Weighted accumulation
+                final_output[mask] += expert_out * w[mask].unsqueeze(1)
+
+        return final_output, indices
+
+    moe_mod.SparseMoE.forward = _weighted_sparse_fwd
 
 # [V29] RESOURCE TELEMETRY UTILS
 try:
@@ -177,68 +179,95 @@ class ExternalReplayBuffer:
 
 class ContinualTrainer:
     """
-    [NeurIPS] Per-task trainer with cosine LR annealing and fresh optimizer per task.
-    Sacred weight momentum is zeroed before each new task to prevent stale
-    momentum from pushing protected weights off their anchors.
+    [NeurIPS] Per-task trainer for ANTARA.
+    ANTARA's train_step uses the framework's internal optimizer (self.optimizer),
+    NOT an external one. So we control LR by patching model.optimizer directly,
+    and attach the cosine scheduler to that internal optimizer.
     """
     def __init__(self, model, device='cuda'):
         self.model = model
         self.device = device
-        self.optimizer = None
+        self.optimizer = None   # kept for API compatibility; not used in ANTARA path
+        self._scheduler = None
 
-    def _make_optimizer(self):
-        """Fresh AdamW with weight decay for each task."""
-        return torch.optim.AdamW(
-            self.model.parameters(),
-            lr=getattr(self.model.config, 'learning_rate', 2e-3),
+    def _reset_internal_optimizer(self, t_idx):
+        """
+        Replace the framework's internal optimizer with a fresh AdamW
+        and attach a cosine scheduler to it.
+        """
+        import torch.optim as optim
+        lr = getattr(self.model.config, 'learning_rate', 2e-3)
+        # Fresh AdamW — clears all momentum state from previous task
+        new_opt = optim.AdamW(
+            self.model.model.parameters(),
+            lr=lr,
             weight_decay=1e-4,
             eps=1e-8,
         )
+        self.model.optimizer = new_opt
+        self.optimizer = new_opt   # keep reference for momentum zeroing
+        return new_opt
 
     def train_task(self, loader, t_idx, epochs=15, replay_buffer=None):
-        # Fresh optimizer every task — prevents stale momentum from corrupting sacred weights
-        if self.optimizer is not None:
-            del self.optimizer
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
-        self.optimizer = self._make_optimizer()
 
-        # Cosine LR schedule over the task's epochs
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=epochs * len(loader), eta_min=1e-5
+        # Replace framework's internal optimizer with a fresh one
+        opt = self._reset_internal_optimizer(t_idx)
+
+        # Cosine LR schedule attached to the framework's actual optimizer
+        self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=epochs * len(loader), eta_min=1e-5
         )
 
         res = train_single_task(
-            self.model, loader, loader, self.optimizer, t_idx,
+            self.model, loader, loader, opt, t_idx,
             device=self.device, epochs=epochs,
             replay_buffer=replay_buffer,
             label_smoothing=0.1 if t_idx > 0 else 0.05,
-            scheduler=scheduler,
+            scheduler=self._scheduler,
         )
         print(f"             [DEBUG] ContinualTrainer.train_task returning for Task {t_idx}.")
         return res
 
 class ContinualEvaluator:
+    """
+    [NeurIPS] Pure Class-IL evaluator — no task ID, global argmax over all seen classes.
+    Uses inference_step which internally passes task_id=None (zero oracle leakage).
+    """
     def __init__(self, model, device='cuda'):
-        self.model = model; self.device = device
+        self.model = model
+        self.device = device
+
     def evaluate(self, loader, t_idx):
         self.model.eval()
         correct = 0; total = 0
         with torch.inference_mode():
             for x, y in loader:
-                x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-                logits = self.model.inference_step(x) if hasattr(self.model, 'inference_step') else self.model(x)
-                if isinstance(logits, tuple): logits = logits[0]
+                x = x.to(self.device, non_blocking=True).float()
+                y = y.to(self.device, non_blocking=True)
+                # inference_step passes task_id=None internally — pure class-IL
+                logits = self.model.inference_step(x)
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+                # Global argmax over all 100 classes — no task-ID slicing
                 preds = torch.argmax(logits, dim=1)
-                correct += (preds == y).sum().item(); total += y.size(0)
+                correct += (preds == y).sum().item()
+                total += y.size(0)
         return correct / total if total > 0 else 0.0
 
 def get_stage_config(stage_id: int, dataset_name: str):
     base_params = {
-        "model_dim": 256, "num_experts": 10, "experts_per_domain": 4, "top_k_experts": 2,
+        "model_dim": 256,
+        # [NeurIPS] Flat MoE: 10 experts, top-2 routing.
+        # HierarchicalMoE with num_domains=2, experts_per_domain=4 creates
+        # 2 × 4 × 4 = 32 full backbone copies — too heavy for 8GB VRAM.
+        # Flat SparseMoE with 10 experts creates exactly 10 copies (~440MB).
+        "num_experts": 10,
+        "experts_per_domain": 4,
+        "top_k_experts": 2,
         "input_dim": 12288 if dataset_name == "TinyImageNet" else 3072,
         "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
-        # [NeurIPS] Tuned LR: 2e-3 gives faster convergence per task than 1e-3
         "learning_rate": 2e-3,
         "use_gradient_centralization": True,
         "use_lookahead": True,
@@ -247,29 +276,31 @@ def get_stage_config(stage_id: int, dataset_name: str):
         return AdaptiveFrameworkConfig(
             **base_params,
             use_moe=True,
-            use_hierarchical_moe=True,
-            # [NeurIPS] SI lambda: 800 is the package's tuned default for CIFAR-100.
-            # 1.0 was 800x too weak — sacred weights had no regularization penalty.
+            # [NeurIPS] Flat MoE — hierarchical creates too many backbone copies
+            use_hierarchical_moe=False,
+            # [NeurIPS] SI lambda: 800 is the package's tuned default for CIFAR-100
             si_lambda=800.0,
-            ewc_lambda=400.0,
-            # [NeurIPS] Hybrid SI+EWC gives best stability-plasticity tradeoff
-            memory_type='hybrid',
-            use_ogd=True,
+            ewc_lambda=0.0,
+            # [NeurIPS] SI-only: EWC Fisher on 118M params is too slow on CPU.
+            # SI path-integral alone is sufficient for BWT >= 0.
+            # Switch to 'hybrid' on A100 where Fisher computation is fast.
+            memory_type='si',
+            # [NeurIPS] OGD disabled on 5060 (subspace SVD on 118M params is slow).
+            # Enable on A100: use_ogd=True, ogd_max_basis_size=256
+            use_ogd=False,
             ogd_max_basis_size=256,
             novelty_z_threshold=1.2,
             adaptation_threshold=0.05,
             enable_consciousness=True,
             use_reptile=True,
             reptile_learning_rate=0.1,
-            # [NeurIPS] Iron Mind quota: 8% per task × 10 tasks = 80% max saturation
-            # This matches the abstract's APR claim exactly
+            # [NeurIPS] 8% per task — matches APR claim in abstract exactly
             iron_mind_quota=0.08,
-            use_elastic_quota=False,  # Fixed quota, not elastic
+            use_elastic_quota=False,
             use_learned_optimizer=False,
-            # [NeurIPS] World model for latent consistency (claimed in abstract)
             enable_world_model=True,
             world_model_loss_weight=0.1,
-            # [NeurIPS] Dreaming disabled — we use external replay buffer instead
+            # External replay buffer handles this — disable internal dreaming
             enable_dreaming=False,
             dream_batch_size=0,
             enable_health_monitor=False,
@@ -300,7 +331,11 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     print("             [DEBUG] Trainer Ready.")
     
     # [V22] PATCHES
-    model.memory.param_id_to_mask = {}; model.memory.task_omega_snapshots = {} 
+    model.memory.param_id_to_mask = {}; model.memory.task_omega_snapshots = {}
+    # [NeurIPS] accumulate_importance is called by the dream loop but doesn't exist
+    # in memory.py — alias it to accumulate_path so SI accumulates during dreaming too
+    if not hasattr(model.memory, 'accumulate_importance'):
+        model.memory.accumulate_importance = model.memory.accumulate_path 
 
     def _v18_governor_patch(mem, task_id, backbone_ref):
         """
@@ -379,7 +414,11 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
     model.governor.update_sacred_mask = _v18_governor_patch
     model.memory._v18_update = _v18_governor_patch
-    model.memory.compute_penalty = lambda *a, **k: torch.tensor(0.0, device=device)
+    # [NeurIPS] DO NOT zero compute_penalty — SI+EWC regularization is the primary
+    # gradient-level protection. Zeroing it means the optimizer gradient points freely
+    # away from anchors, and post-step restoration can't fully counteract momentum buildup.
+    # The penalty is what makes gradients respect the sacred manifold during backward().
+    # model.memory.compute_penalty = lambda *a, **k: torch.tensor(0.0, device=device)
     
     @torch._dynamo.disable
     def _v18_pre_warm_protection_map(self):
@@ -421,39 +460,41 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
     model.pre_warm_protection_map = types.MethodType(_v18_pre_warm_protection_map, model)
     _orig_train_step = model.train_step
+
     def _v18_absolute_zero_train_step(self, x, target_data=None, **kwargs):
         # Rebuild protection map if sacred mask has changed since last build
-        if not hasattr(self.memory, '_v24_flat_grad_logic') or self.memory._v18_cache_id != len(self.memory.sacred_mask):
+        if not hasattr(self.memory, '_v24_flat_grad_logic') or \
+                self.memory._v18_cache_id != len(self.memory.sacred_mask):
             self.pre_warm_protection_map()
+
+        # Freeze BN stats for sacred modules during forward
         for m in self.memory._v18_sacred_bns:
             m.eval()
+
+        current_task_id = kwargs.get('task_id', getattr(self, 'current_task', 0))
+        is_plastic = (current_task_id is not None and current_task_id > 0)
+
+        # Run the full train_step (backward + optimizer.step() happen inside)
         res = _orig_train_step(x, target_data=target_data, **kwargs)
-        with torch.no_grad():
-            # [FIX] Use task_id from kwargs — current_task is never reliably set on the wrapper
-            current_task_id = kwargs.get('task_id', getattr(self, 'current_task', 0))
-            is_plastic = (current_task_id is not None and current_task_id > 0)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            for p, mult, anc, mask in self.memory._v24_flat_grad_logic:
-                if p.grad is None:
-                    continue
-                if mask.any():
-                    if is_plastic:
-                        # Zero gradient on sacred weights
-                        p.grad.data.masked_fill_(mask.to(p.device), 0.0)
-                        # Restore sacred weight values from anchor (anchor is on same device after pre_warm)
-                        p.data.copy_(torch.where(mask.to(p.device), anc.to(p.device), p.data))
-                    else:
-                        # Task 0: just zero sacred grads (mask is empty anyway for task 0)
-                        p.grad.data.masked_fill_(mask.to(p.device), 0.0)
-                else:
-                    if not is_plastic:
-                        # Task 0 plastic weights: slight gradient boost
-                        p.grad.data.mul_(mult)
+
+        # Post-step: hard-restore sacred weights to anchor values.
+        # This is the correct place — after optimizer.step() has already run.
+        # It catches drift from weight decay, lookahead, and reptile.
+        # The SI+EWC penalty (compute_penalty) handles gradient-level protection
+        # during backward, so we don't need pre-backward hooks here.
+        if is_plastic:
+            with torch.no_grad():
+                for p, mult, anc, mask in self.memory._v24_flat_grad_logic:
+                    if mask.any():
+                        p.data.copy_(torch.where(
+                            mask.to(p.device),
+                            anc.to(p.device),
+                            p.data
+                        ))
+
         for m in self.memory._v18_sacred_bns:
             m.train()
-        import sys
-        sys.stderr.write(".")
-        sys.stderr.flush()
+
         return res
     model.train_step = types.MethodType(_v18_absolute_zero_train_step, model)
 

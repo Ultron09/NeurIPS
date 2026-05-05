@@ -69,7 +69,7 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                                                   meta_step=True,
                                                   record_stats=True)
                     step_loss = result.get('total_loss', result.get('loss', 0.0))
-                    # Step cosine scheduler if provided
+                    # Scheduler steps AFTER train_step returns (which calls optimizer.step() internally)
                     if scheduler is not None:
                         scheduler.step()
 
