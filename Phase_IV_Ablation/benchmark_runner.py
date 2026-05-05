@@ -268,10 +268,22 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     
     config = get_stage_config(stage_id, dataset_name)
     model = AdaptiveFramework(model_factory(dataset_name, num_classes=num_classes), config=config).to(device)
-    # [V30.2] Inject density metadata for precise Governance
-    model.memory.total_tasks = num_tasks
-    model.memory.num_classes = num_classes
     
+    # [V24.3] TITAN PRE-HEAT: Forcing CUDA Graph Warmup
+    print("             [TITAN] Pre-heating Cognitive Kernels (CUDA Graphs)...")
+    torch._dynamo.config.optimize_ddp = False 
+    # mode="reduce-overhead" uses CUDA Graphs for maximum A100 throughput
+    model = torch.compile(model, mode="reduce-overhead")
+    
+    # Run a dummy pass to trigger JIT compilation before the loop
+    with torch.cuda.amp.autocast():
+        dummy_x = torch.randn(8, 3, 32, 32).to(device)
+        try:
+            _ = model(dummy_x)
+            print("             [TITAN] Kernel Pre-Heat Successful.")
+        except:
+            pass
+
     trainer = ContinualTrainer(model, device=device); evaluator = ContinualEvaluator(model, device=device)
     
     # =========================================================================
