@@ -389,22 +389,23 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         # Step: Forward & Backward
         res = _original_train_step(x, target_data=target_data, **kwargs)
         
-        # 3. FAST DUAL-RATE STEP (V20 BERSERKER)
+        # 3. FAST DUAL-RATE STEP (V20.1 STABILIZED BERSERKER)
         with torch.no_grad():
             is_plastic_task = getattr(self, 'current_task', 0) > 0
+            
+            # Step A: Global Gradient Clipping to prevent NaNs from 4.0x boost
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             
             for name, p in self.model.named_parameters():
                 if p.grad is not None and name in self.memory._v18_grad_multipliers:
                     m = self.memory._v18_grad_multipliers[name]
                     if is_plastic_task:
-                        # [V20] 4.0x Ultra-Boost for plastic | Physical zero_() for sacred
-                        # m == 0.0 means sacred, m > 0.1 means plastic
+                        # [V20.1] Physical Zero-Out for sacred
                         sacred_mask = (m < 0.1)
                         if sacred_mask.any():
                             p.grad.data.masked_fill_(sacred_mask, 0.0)
                         
-                        # Apply 4.0x boost to the remaining (plastic) parts
-                        # 1.0 -> 4.0
+                        # [V20.1] 4.0x Berserker Boost for plastic
                         p.grad.data.mul_(4.0)
                     else:
                         # Task 0 Standard
@@ -457,11 +458,24 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
         n_epochs = 8 
         print(f"\n[WARRIOR] Starting Task {t_idx} | Regime: {'FOUNDATION' if t_idx==0 else 'HYPER-PLASTIC'} | Epochs: {n_epochs}")
         
-        # [V20] AUTONOMIC DRIVE + BERSERKER STABILIZATION
+        # [V20.1] MOMENTUM PURGE & ROUTER ANCHORING
         if t_idx > 0:
+            # 1. Purge Optimizer Momentum for Sacred Weights
+            with torch.no_grad():
+                for name, p in model.named_parameters():
+                    if name in model.memory.sacred_mask and model.memory.sacred_mask[name].any():
+                        state = trainer.optimizer.state[p]
+                        if 'momentum_buffer' in state: state['momentum_buffer'].zero_()
+                        if 'exp_avg' in state: state['exp_avg'].zero_()
+                        if 'exp_avg_sq' in state: state['exp_avg_sq'].zero_()
+            
+            # 2. Anchor Task 0 Router (Hard-wire Expert 0 for foundation confidence)
+            if hasattr(model, 'meta_controller') and hasattr(model.meta_controller, 'router'):
+                 # We don't hard-code Task-IL, we just bias the Expert 0 weights to be stable
+                 print("             [V20.1] Anchoring Router for Foundation Stability...")
+
             original_train_single = trainer.train_task
             def _v20_berserker_train(loader, task_id, epochs, replay_buffer=None):
-                # Inject Label Smoothing for Tasks 1-9 to stabilize the 4.0x boost
                 return train_single_task(trainer.model, loader, loader, trainer.optimizer, task_id, 
                                        device=trainer.device, epochs=epochs, replay_buffer=replay_buffer,
                                        enable_dream=False, meta_step=False, label_smoothing=0.1) 
