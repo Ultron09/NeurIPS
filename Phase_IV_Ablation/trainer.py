@@ -42,6 +42,8 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
     try:
         for epoch in range(epochs):
             model.train()
+            total_loss = 0.0
+            total_steps = 0
             print(f"Task {t_idx} Epoch {epoch} started...")
             for x, y in train_loader:
                 start_time = time.time()
@@ -151,9 +153,11 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                                 replay_buffer.update(x, y)
                         if der_module: der_module.update(x, y, logits.detach())
 
-                    total_step_time += (time.time() - start_time) * 1000
+                    total_loss += step_loss.item() if torch.is_tensor(step_loss) else step_loss
                     total_steps += 1
-            print(f"\n             [DEBUG] Task {t_idx} Epoch {epoch} completed.", flush=True)
+            
+            avg_epoch_loss = total_loss / total_steps if total_steps > 0 else 0
+            print(f"\n             [DEBUG] Task {t_idx} Epoch {epoch} completed. Avg Loss: {avg_epoch_loss:.4f}", flush=True)
 
     except Exception as e:
         print(f"\n[CRITICAL ERROR] Training loop failed: {str(e)}", flush=True)

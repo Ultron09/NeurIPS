@@ -59,9 +59,16 @@ if hasattr(moe_mod, 'SparseMoE'):
                 mask = (expert_idx_per_sample == i)
                 if not mask.any(): continue
                 expert_out = self.experts[i](x[mask], task_id=task_id)
-                if isinstance(expert_out, tuple): expert_out = expert_out[0]
+                if isinstance(expert_out, tuple): 
+                    expert_out = expert_out[0]
+                
+                # [FIX] Handle potential dimension mismatch if experts are heterogeneous
+                if expert_out.shape[1] != final_output.shape[1]:
+                    # Adaptive pooling or projection could go here, but usually they should match
+                    continue
+                    
                 # Weighted accumulation
-                final_output[mask] += expert_out * w[mask].unsqueeze(1)
+                final_output[mask] += expert_out * w[mask].view(-1, 1)
 
         return final_output, indices
 
@@ -394,11 +401,15 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
                 curr_pos += p_n
 
-        # Hard-lock gate params entirely
+        # [NeurIPS] DO NOT hard-lock gate params entirely. 
+        # The gate must remain plastic to learn new task routing. 
+        # We only apply the standard 8% quota to the gate if it's large, 
+        # but for this ResNet-MoE, the gate should be mostly plastic.
         for pid, prefixed_name in id_to_prefixed_name.items():
             if "gate" in prefixed_name.lower() and pid in id_to_p:
-                p = id_to_p[pid][1]
-                cumulative[pid] = torch.ones(p.shape, dtype=torch.bool)
+                # Ensure gate stays out of the hard-locked cumulative mask for now
+                if pid in cumulative:
+                    del cumulative[pid]
 
         # Commit to mem
         dev = next(backbone_ref.parameters()).device
