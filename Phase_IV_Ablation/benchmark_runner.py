@@ -206,12 +206,14 @@ class ContinualTrainer:
 
     def _reset_internal_optimizer(self, t_idx):
         """
-        Replace the framework's internal optimizer with a fresh AdamW
-        and attach a cosine scheduler to it.
+        Replace the framework's internal optimizer with a fresh AdamW.
+        Tasks 1+ use a lower LR — replay buffer creates conflicting gradients
+        and the sacred mask means fewer params are being updated.
         """
         import torch.optim as optim
-        lr = getattr(self.model.config, 'learning_rate', 2e-3)
-        # Fresh AdamW — clears all momentum state from previous task
+        base_lr = getattr(self.model.config, 'learning_rate', 2e-3)
+        # Lower LR for subsequent tasks: replay + sacred mask = smaller effective batch
+        lr = base_lr if t_idx == 0 else base_lr * 0.5
         new_opt = optim.AdamW(
             self.model.model.parameters(),
             lr=lr,
@@ -219,7 +221,7 @@ class ContinualTrainer:
             eps=1e-8,
         )
         self.model.optimizer = new_opt
-        self.optimizer = new_opt   # keep reference for momentum zeroing
+        self.optimizer = new_opt
         return new_opt
 
     def train_task(self, loader, t_idx, epochs=15, replay_buffer=None):
@@ -350,18 +352,45 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         model.memory.accumulate_importance = model.memory.accumulate_path
 
     # [CRITICAL] Disable the package's _apply_sacred_restoration.
-    # It uses memory.anchor which has near-zero values for unseen task FC rows.
-    # Every optimizer step it would snap rows 10-19 back to near-zero during task 1.
-    # Our own post-step restoration in _v18_absolute_zero_train_step is task-aware
-    # and handles this correctly.
     model._apply_sacred_restoration = lambda: None
 
-    # [CRITICAL] Disable lookahead — it copies slow_weights back into the model
-    # after every k steps. slow_weights were captured at task 0 end, so they have
-    # near-zero values for rows 10-99. This would overwrite task 1's learned FC rows.
+    # [CRITICAL] Disable lookahead.
     model.config.use_lookahead = False
     if hasattr(model, 'slow_weights'):
         del model.slow_weights
+
+    # [CRITICAL] Replace compute_penalty to only penalize NON-sacred (plastic) params.
+    # The sacred params are already hard-locked by gradient zeroing in the train step.
+    # Applying SI penalty to sacred params creates a massive loss term that fights
+    # the optimizer on plastic params too (shared gradients through the backbone).
+    _orig_compute_penalty = model.memory.compute_penalty
+    def _masked_compute_penalty(adaptive_mode='NORMAL', step_in_mode=0):
+        if not model.memory.is_enabled():
+            return torch.tensor(0.0, device=device)
+        loss = torch.tensor(0.0, device=device)
+        si_lam = model.memory.si_lambda
+        if model.memory.method in ['si', 'hybrid']:
+            for m_idx, m_tracked in enumerate(model.memory.models):
+                for name, p in m_tracked.named_parameters():
+                    unique_name = f"m{m_idx}_{name}"
+                    if unique_name not in model.memory.omega:
+                        continue
+                    # Only penalize plastic (non-sacred) positions
+                    sacred = model.memory.sacred_mask.get(unique_name)
+                    omega = model.memory.omega[unique_name].to(p.device)
+                    anchor = model.memory.anchor.get(unique_name)
+                    if anchor is None:
+                        continue
+                    anchor = anchor.to(p.device)
+                    diff_sq = (p - anchor).pow(2)
+                    if sacred is not None and sacred.any():
+                        # Zero out penalty on sacred positions — they're hard-locked
+                        plastic_mask = ~sacred.to(p.device)
+                        loss = loss + (omega * diff_sq * plastic_mask).sum()
+                    else:
+                        loss = loss + (omega * diff_sq).sum()
+        return loss * si_lam
+    model.memory.compute_penalty = _masked_compute_penalty
 
     def _v18_governor_patch(mem, task_id, backbone_ref):
         """
