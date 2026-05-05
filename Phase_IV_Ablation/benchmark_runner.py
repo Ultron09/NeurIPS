@@ -317,7 +317,31 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
     # Kill Layer 5: Surgical weight decay on non-sacred params
     model._compute_surgical_weight_decay = lambda *a, **k: torch.tensor(0.0, device=device)
     
-    print("             [V18_BINARY] Half-lock mechanisms disabled. CAS-only protection active.")
+    # [V18.2] BN CRYOSTASIS: Hard-lock normalization stats
+    # This prevents Task 1 from overwriting the running_mean/var of Task 0 neurons.
+    _original_train_step = model.train_step
+    def _v18_titanium_train_step(self, *args, **kwargs):
+        sacred_modules = []
+        if hasattr(self.memory, 'sacred_mask'):
+            for m_name, m in self.model.named_modules():
+                if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
+                    # Standard MoE names are m{idx}_{name}
+                    unique_name_prefix = f"m0_{m_name}"
+                    is_sacred = False
+                    for p_name, _ in m.named_parameters(recurse=False):
+                        full_name = f"{unique_name_prefix}.{p_name}"
+                        if full_name in self.memory.sacred_mask and self.memory.sacred_mask[full_name].any():
+                            is_sacred = True; break
+                    if is_sacred:
+                        m.eval(); sacred_modules.append(m)
+        
+        res = _original_train_step(*args, **kwargs)
+        for m in sacred_modules: m.train()
+        return res
+    
+    model.train_step = types.MethodType(_v18_titanium_train_step, model)
+    
+    print("             [V18.2_TITANIUM] BN Cryostasis Active. Hard-locking T0 stats.")
     # ===========================================================================
 
     if hasattr(model, 'meta_controller') and model.meta_controller.reptile:
