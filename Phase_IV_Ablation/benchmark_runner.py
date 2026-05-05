@@ -347,11 +347,36 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
 
     _original_train_step = model.train_step
     def _v18_absolute_zero_train_step(self, x, target_data=None, **kwargs):
-        # [V18.3] ZENITH BN CRYOSTASIS
-        sacred_modules = []
-        if hasattr(self.memory, 'sacred_mask'):
+        # 1. Lazy-init the Gradient Multiplier Cache (Only once per task)
+        if not hasattr(self.memory, '_v18_grad_multipliers') or self.memory._v18_cache_id != len(self.memory.sacred_mask):
+            print("             [V18.10] Compiling Gradient Multiplier Cache...")
+            self.memory._v18_grad_multipliers = {}
             experts = getattr(self.memory, 'models', [])
             num_experts = len(experts) if experts else getattr(self.config, 'num_experts', 1)
+            
+            with torch.no_grad():
+                for name, p in self.model.named_parameters():
+                    # Build combined mask across all experts
+                    combined_mask = torch.zeros_like(p, dtype=torch.bool)
+                    found = False
+                    for exp_idx in range(max(1, num_experts)):
+                        key = f"m{exp_idx}_{name}"
+                        if key in self.memory.sacred_mask:
+                            combined_mask |= self.memory.sacred_mask[key].to(p.device)
+                            found = True
+                    
+                    if found:
+                        # 0.0 for sacred, 1.2 for plastic
+                        self.memory._v18_grad_multipliers[name] = torch.where(combined_mask, 0.0, 1.2).to(p.device)
+                    else:
+                        # Fully plastic
+                        self.memory._v18_grad_multipliers[name] = 1.2
+            
+            self.memory._v18_cache_id = len(self.memory.sacred_mask)
+
+        # 2. BN Cryostasis
+        sacred_modules = []
+        if hasattr(self.memory, 'sacred_mask'):
             for m_name, m in self.model.named_modules():
                 if isinstance(m, (torch.nn.modules.batchnorm._BatchNorm)):
                     is_sacred = False
@@ -360,28 +385,13 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42):
                             is_sacred = True; break
                     if is_sacred: m.eval(); sacred_modules.append(m)
         
-        # Step 1: Forward & Backward (using framework's native engine)
         res = _original_train_step(x, target_data=target_data, **kwargs)
         
-        # Step 2: DUAL-RATE GRADIENT ENGINE (Lock + Boost)
-        # Sacred = 0.0x (Lock) | Non-Sacred = 1.2x (Plasticity Boost)
-        if hasattr(self.memory, 'sacred_mask'):
+        # 3. FAST DUAL-RATE STEP
+        with torch.no_grad():
             for name, p in self.model.named_parameters():
-                if p.grad is None: continue
-                
-                is_p_sacred = False
-                combined_mask = torch.zeros_like(p.grad, dtype=torch.bool)
-                for exp_idx in range(max(1, num_experts)):
-                    key = f"m{exp_idx}_{name}"
-                    if key in self.memory.sacred_mask:
-                        combined_mask |= self.memory.sacred_mask[key].to(p.device)
-                        is_p_sacred = True
-                
-                if is_p_sacred:
-                    multiplier = torch.where(combined_mask, 0.0, 1.2)
-                    p.grad.data.mul_(multiplier.to(p.grad.dtype))
-                else:
-                    p.grad.data.mul_(1.2)
+                if p.grad is not None and name in self.memory._v18_grad_multipliers:
+                    p.grad.data.mul_(self.memory._v18_grad_multipliers[name])
 
         for m in sacred_modules: m.train()
         return res
