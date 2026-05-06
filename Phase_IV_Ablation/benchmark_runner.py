@@ -498,13 +498,20 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     # Component (iii) from the ANTARA abstract: anchors internal representations
     # against distributional drift. Directly minimises δ = sup‖z(x)−z₀(x)‖
     # from the stability bound. α controls the consistency coefficient.
-    # _frozen_experts: list of frozen ContinualResNet copies, one per MoE expert.
-    # Updated after each task to anchor ALL seen tasks' feature spaces.
     # We anchor only early layers (conv1→layer2) to preserve universal feature
     # detectors while allowing later layers to adapt for new tasks.
     _frozen_experts = []   # list of frozen ContinualResNet per expert
     _LC_ALPHA        = 1.0    # α — conservative to preserve plasticity
     _LC_BATCH        = 64     # replay samples per LCL backward pass
+
+    # ── Expert dedication state ────────────────────────────────────────────────
+    # After each task, freeze the top-2 most-used experts so they can't be
+    # overwritten by subsequent tasks. This is the PackNet-style hard protection
+    # applied at the expert level — no soft regularization needed.
+    # With 10 experts and 10 tasks, each task gets ~1 dedicated expert.
+    _task_expert_map = {}   # task_id -> list of frozen expert indices
+    _EXPERTS_PER_TASK = 1   # freeze 1 expert per task (10 tasks, 10 experts)
+    _moe = model.model if hasattr(model.model, 'experts') else None
     replay_buf = ExternalReplayBuffer(
         per_task=500,
         img_size=64 if dataset_name == "TinyImageNet" else 32
@@ -541,8 +548,12 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         print(f"\n[WARRIOR] Task {t_idx} | Epochs: {EPOCHS}")
 
         # Disable gradient noise injection for this task
-        # (noise is added to ALL grads including sacred positions)
-        model._steps_since_task_start = 100  # keeps condition steps_since_start < 100 False
+        model._steps_since_task_start = 100
+
+        # Reset expert usage counters so we track which experts this task uses
+        if _moe is not None and hasattr(_moe, 'reset_usage'):
+            _moe.reset_usage()
+            print(f"  [MoE] Expert usage counters reset for Task {t_idx}")
 
         # Fresh AdamW — no stale momentum from previous task
         lr = config.learning_rate if t_idx == 0 else config.learning_rate * 0.5
@@ -787,6 +798,24 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                             fp.data[~mask] = lp.data[~mask]
             print(f"  [LCL] Expert anchors updated after Task {t_idx} "
                   f"(free positions refreshed, sacred positions held).")
+
+        # ── Expert dedication: freeze top-used experts after each task ──────────
+        # The most-used experts have specialized for this task. Freezing them
+        # prevents subsequent tasks from overwriting their representations.
+        # This is hard protection (requires_grad=False) — no soft regularization.
+        if _moe is not None and hasattr(_moe, 'get_top_experts'):
+            top_experts = _moe.get_top_experts(_EXPERTS_PER_TASK)
+            # Don't freeze experts already frozen for previous tasks
+            already_frozen = _moe.get_frozen_experts() if hasattr(_moe, 'get_frozen_experts') else []
+            new_to_freeze = [e for e in top_experts if e not in already_frozen]
+            if new_to_freeze:
+                _moe.freeze_experts(new_to_freeze)
+                _task_expert_map[t_idx] = new_to_freeze
+                print(f"  [MoE] Task {t_idx} experts frozen: {new_to_freeze} "
+                      f"(usage: {[int(_moe.expert_usage[i].item()) for i in new_to_freeze]})")
+            frozen_all = _moe.get_frozen_experts() if hasattr(_moe, 'get_frozen_experts') else []
+            free_count = num_tasks - len(frozen_all)
+            print(f"  [MoE] Frozen experts: {frozen_all} | Free: {free_count}/{num_tasks}")
 
         # Evaluate
         task_accs = []
