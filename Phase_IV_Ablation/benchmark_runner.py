@@ -36,10 +36,22 @@ faulthandler.enable()
 
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet18
+from torchvision.models.resnet import ResNet, BasicBlock
 from torchvision import transforms
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 import airborne_antara.moe as moe_mod
+
+# ── CIFAR-adapted ResNet-18 ────────────────────────────────────────────────────
+# Standard ResNet-18 uses 7×7 conv + maxpool which reduces 32×32 → 4×4 by layer1.
+# For CIFAR-100 (32×32), we use 3×3 conv, stride 1, no maxpool — keeps spatial
+# resolution high enough for BN to work with small batches.
+class ContinualResNet(ResNet):
+    def __init__(self, num_classes=100):
+        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+        self.conv1   = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.maxpool = nn.Identity()
+    def forward(self, x, task_id=None, **kwargs):
+        return super().forward(x)
 
 # ── Weighted MoE dispatcher — no task_id oracle ────────────────────────────────
 if hasattr(moe_mod, 'SparseMoE'):
@@ -73,15 +85,7 @@ if hasattr(moe_mod, 'SparseMoE'):
             for i in range(self.num_experts):
                 sel = (ei == i)
                 if not sel.any(): continue
-                # BN requires batch_size > 1 during training.
-                # For single-sample batches, temporarily use eval mode
-                # so BN uses running stats instead of batch stats.
-                single_sample = self.training and sel.sum() < 2
-                if single_sample:
-                    self.experts[i].eval()
                 e_out = self.experts[i](x[sel], task_id=None)
-                if single_sample:
-                    self.experts[i].train()
                 if isinstance(e_out, tuple): e_out = e_out[0]
                 if e_out.shape[1] == self._out_dim:
                     out[sel] += e_out * w[sel].view(-1, 1)
@@ -182,8 +186,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
     config = get_stage_config(stage_id, dataset_name)
 
-    # Standard resnet18 backbone — matches backup_0.1.36.py
-    backbone = resnet18(num_classes=num_classes)
+    # CIFAR-adapted ResNet-18 backbone — 3×3 conv, no maxpool, keeps spatial resolution
+    backbone = ContinualResNet(num_classes=num_classes)
     model    = AdaptiveFramework(backbone, config=config).to(device)
 
     # Kill framework auto-management
