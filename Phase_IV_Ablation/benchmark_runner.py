@@ -426,10 +426,29 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # Disable gradient noise injection for this task
         model._steps_since_task_start = 100
 
+        # Snapshot FC rows 0-9 before training to detect any drift
+        if t_idx > 0:
+            _fc_pre = {}
+            for exp_name, exp_bb in _all_expert_backbones:
+                fc = getattr(exp_bb, 'fc', None)
+                if fc is not None:
+                    _fc_pre[exp_name] = fc.weight.data[:cpt].clone()
+
         train_single_task(
             model, train_loader, train_loader, None, t_idx,
             device=device, epochs=EPOCHS,
         )
+
+        # Check FC drift after training
+        if t_idx > 0 and _fc_pre:
+            max_drift = 0.0
+            for exp_name, exp_bb in _all_expert_backbones:
+                fc = getattr(exp_bb, 'fc', None)
+                if fc is not None and exp_name in _fc_pre:
+                    drift = (fc.weight.data[:cpt] - _fc_pre[exp_name]).abs().max().item()
+                    max_drift = max(max_drift, drift)
+            print(f"  [FC DRIFT] Task {t_idx}: max FC rows 0-{cpt-1} drift = {max_drift:.8f} "
+                  f"({'DRIFTING!' if max_drift > 1e-6 else 'HELD'})")
 
         # ── Consolidation + Immutable Anchoring (V23) ──────────────────────────
         print(f"  [ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
