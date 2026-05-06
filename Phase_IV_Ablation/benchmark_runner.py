@@ -89,6 +89,27 @@ def model_factory(dataset_name, num_classes=100):
     return ContinualResNet(num_classes=num_classes)
 
 # ── Latent Consistency Loss helpers ───────────────────────────────────────────
+def _get_resnet_backbone(framework_model):
+    """
+    Navigate the AdaptiveFramework → SparseMoE → Expert → ContinualResNet path.
+    When use_moe=True, framework_model.model is SparseMoE, and the backbone
+    lives at model.model.experts[0].model (the first expert's base model).
+    """
+    m = framework_model.model
+    # SparseMoE path: experts[0].model is the ContinualResNet
+    if hasattr(m, 'experts') and len(m.experts) > 0:
+        expert0 = m.experts[0]
+        if hasattr(expert0, 'model'):
+            return expert0.model
+        # Some versions wrap differently
+        for child in expert0.children():
+            if hasattr(child, 'conv1'):
+                return child
+    # Fallback: direct model
+    if hasattr(m, 'conv1'):
+        return m
+    raise RuntimeError(f"Cannot find ContinualResNet backbone in {type(m).__name__}")
+
 def _extract_features(backbone, x):
     """
     Extract penultimate-layer features (avgpool output, before FC).
@@ -530,7 +551,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     with torch.no_grad():
                         z_frozen = _extract_features(_frozen_backbone, rx)
                     # Current features — with grad through free weights
-                    _backbone_live = model.model  # ContinualResNet, not SparseMoE
+                    # Navigate SparseMoE → experts[0].model to get ContinualResNet
+                    _backbone_live = _get_resnet_backbone(model)
                     _backbone_live.train()
                     z_current = _extract_features(_backbone_live, rx)
                     # LCL = α · mean(1 - cosine_similarity(z_current, z_frozen))
@@ -691,14 +713,13 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         print(f"  [SENTIENT] Locked: {total_sacred:,}/{num_total:,} ({model.memory.saturation_level:.2%})")
 
         # ── Save frozen backbone after Task 0 for Latent Consistency Loss ──────
-        # model.model is the ContinualResNet backbone (not model.memory.models[0]
-        # which is SparseMoE). We copy weights via state_dict to avoid deepcopy
+        # model.model is SparseMoE when use_moe=True; the ContinualResNet lives
+        # at experts[0].model. We copy weights via state_dict to avoid deepcopy
         # issues with non-leaf AMP graph tensors.
         if t_idx == 0:
+            _live_resnet = _get_resnet_backbone(model)
             _frozen_backbone = model_factory(dataset_name, num_classes).to(device)
-            _frozen_backbone.load_state_dict(
-                model.model.state_dict(), strict=False
-            )
+            _frozen_backbone.load_state_dict(_live_resnet.state_dict(), strict=False)
             _frozen_backbone.eval()
             for _p in _frozen_backbone.parameters():
                 _p.requires_grad = False
