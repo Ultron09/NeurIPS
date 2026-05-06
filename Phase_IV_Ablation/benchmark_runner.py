@@ -530,7 +530,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     with torch.no_grad():
                         z_frozen = _extract_features(_frozen_backbone, rx)
                     # Current features — with grad through free weights
-                    _backbone_live = model.memory.models[0]
+                    _backbone_live = model.model  # ContinualResNet, not SparseMoE
                     _backbone_live.train()
                     z_current = _extract_features(_backbone_live, rx)
                     # LCL = α · mean(1 - cosine_similarity(z_current, z_frozen))
@@ -691,12 +691,13 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         print(f"  [SENTIENT] Locked: {total_sacred:,}/{num_total:,} ({model.memory.saturation_level:.2%})")
 
         # ── Save frozen backbone after Task 0 for Latent Consistency Loss ──────
-        # deepcopy fails on non-leaf tensors (weight_norm / AMP graph nodes).
-        # Instead: instantiate a fresh backbone and load the state dict.
+        # model.model is the ContinualResNet backbone (not model.memory.models[0]
+        # which is SparseMoE). We copy weights via state_dict to avoid deepcopy
+        # issues with non-leaf AMP graph tensors.
         if t_idx == 0:
             _frozen_backbone = model_factory(dataset_name, num_classes).to(device)
             _frozen_backbone.load_state_dict(
-                model.memory.models[0].state_dict(), strict=False
+                model.model.state_dict(), strict=False
             )
             _frozen_backbone.eval()
             for _p in _frozen_backbone.parameters():
