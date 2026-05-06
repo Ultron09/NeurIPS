@@ -515,6 +515,25 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                         bn_drift = max(bn_drift, d)
             print(f"  [BN DRIFT] Task {t_idx}: max BN running_mean drift = {bn_drift:.6f}")
 
+        # [BUGFIX] Weight Alignment (WA) to eliminate Recency Bias
+        if t_idx > 0:
+            with torch.no_grad():
+                for _, exp_bb in _all_expert_backbones:
+                    fc = getattr(exp_bb, 'fc', None)
+                    if fc is not None:
+                        old_w = fc.weight.data[:t_idx * cpt, :]
+                        new_w = fc.weight.data[t_idx * cpt:(t_idx + 1) * cpt, :]
+                        
+                        norm_old = torch.norm(old_w, dim=1).mean()
+                        norm_new = torch.norm(new_w, dim=1).mean()
+                        
+                        if norm_new > 0:
+                            gamma = norm_old / norm_new
+                            fc.weight.data[t_idx * cpt:(t_idx + 1) * cpt, :] *= gamma
+                            if fc.bias is not None:
+                                fc.bias.data[t_idx * cpt:(t_idx + 1) * cpt] *= gamma
+            print("  [WEIGHT ALIGNMENT] FC magnitudes normalized across all experts.")
+
         # ── Consolidation + Immutable Anchoring (V23) ──────────────────────────
         print(f"  [ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
         model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
