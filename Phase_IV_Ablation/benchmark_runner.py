@@ -540,6 +540,37 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     _EXPERTS_PER_TASK = 1   # freeze 1 expert per task (10 tasks, 10 experts)
     _moe = model.model if hasattr(model.model, 'experts') else None
     print(f"  [MoE] model.model type: {type(model.model).__name__}, _moe set: {_moe is not None}")
+
+    # Gate column protection: when an expert is frozen, also freeze the gate's
+    # output column for that expert so routing is preserved at inference time.
+    # Without this, the gate forgets to route old-task inputs to frozen experts.
+    _frozen_expert_set = set()
+
+    if _moe is not None and hasattr(_moe, 'gate') and hasattr(_moe.gate, 'gate'):
+        _gate_linear = _moe.gate.gate  # nn.Linear(input_dim, num_experts)
+
+        def _gate_col_hook(grad):
+            if not _frozen_expert_set:
+                return grad
+            g = grad.clone()
+            for idx in _frozen_expert_set:
+                if idx < g.shape[0]:
+                    g[idx] = 0.0  # gate.weight: (num_experts, input_dim)
+            return g
+
+        _gate_linear.weight.register_hook(_gate_col_hook)
+        if _gate_linear.bias is not None:
+            def _gate_bias_hook(grad):
+                if not _frozen_expert_set:
+                    return grad
+                g = grad.clone()
+                for idx in _frozen_expert_set:
+                    if idx < g.shape[0]:
+                        g[idx] = 0.0
+                return g
+            _gate_linear.bias.register_hook(_gate_bias_hook)
+        print(f"  [MoE] Gate column protection hooks installed.")
+
     replay_buf = ExternalReplayBuffer(
         per_task=500,
         img_size=64 if dataset_name == "TinyImageNet" else 32
@@ -858,6 +889,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                         for p in _moe.experts[idx].parameters():
                             p.requires_grad = False
                 _task_expert_map[t_idx] = new_to_freeze
+                _frozen_expert_set.update(new_to_freeze)  # protect gate columns too
                 usage_vals = [int(_moe.expert_usage[i].item()) for i in new_to_freeze]
                 print(f"  [MoE] Task {t_idx} experts frozen: {new_to_freeze} (usage: {usage_vals})")
 
