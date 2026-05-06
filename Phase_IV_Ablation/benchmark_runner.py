@@ -560,6 +560,21 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             task_accs.append(acc)
             metrics.update(t_idx, i, acc)
 
+        # Debug: check logit distribution for Task 0 after Task 1
+        if t_idx == 1:
+            model.eval()
+            sample_x, sample_y = next(iter(test_loaders[0]))
+            sample_x = sample_x[:8].to(device).float()
+            sample_y = sample_y[:8].to(device)
+            with torch.inference_mode():
+                logits = model.inference_step(sample_x)
+                if isinstance(logits, tuple): logits = logits[0]
+            print(f"  [DEBUG] Task 0 test sample labels: {sample_y.tolist()}")
+            print(f"  [DEBUG] Logits shape: {logits.shape}")
+            print(f"  [DEBUG] Predicted classes: {logits.argmax(1).tolist()}")
+            print(f"  [DEBUG] Logits[:, 0:10] max: {logits[:, :10].max(1).values.tolist()}")
+            print(f"  [DEBUG] Logits[:, 10:20] max: {logits[:, 10:20].max(1).values.tolist()}")
+
         avg = sum(task_accs) / len(task_accs)
         print(f"  [LIVE] After Task {t_idx}: Avg = {avg:.2%}")
         for i, a in enumerate(task_accs):
