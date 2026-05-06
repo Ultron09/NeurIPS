@@ -142,7 +142,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
         "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
         "learning_rate": 2e-3,
         "use_gradient_centralization": True,
-        # Lookahead DISABLED — it overwrites sacred weights via slow_weights
+        # Lookahead DISABLED — overwrites sacred weights via slow_weights
         "use_lookahead": False,
     }
     if stage_id == 7:
@@ -150,18 +150,26 @@ def get_stage_config(stage_id: int, dataset_name: str):
             **base,
             use_moe=True,
             use_hierarchical_moe=False,
+            # (iv) APR: Hybrid SI+EWC gives the strongest importance signal.
+            # SI tracks path integrals (gradient × weight change) — identifies
+            # weights that moved a lot during training (high plasticity).
+            # EWC Fisher identifies weights with high gradient variance (high sensitivity).
+            # Combined: we lock the weights that are BOTH sensitive AND heavily used.
             si_lambda=1.0,
-            ewc_lambda=0.0,
-            memory_type='si',
+            ewc_lambda=400.0,          # Strong Fisher — identifies truly critical weights
+            memory_type='hybrid',      # SI + EWC combined importance
             use_ogd=False,
-            # Reptile DISABLED — it overwrites sacred weights
+            # Reptile DISABLED — overwrites sacred weights
             use_reptile=False,
             reptile_learning_rate=0.1,
             iron_mind_quota=0.08,
             use_elastic_quota=False,
             use_learned_optimizer=False,
-            enable_consciousness=False,
-            enable_world_model=False,
+            # (i) Meta-Control Global Workspace — consciousness module
+            enable_consciousness=True,
+            # (iii) Latent Consistency Loss via World Model
+            enable_world_model=True,
+            world_model_loss_weight=0.1,
             enable_dreaming=False,
             dream_batch_size=0,
             enable_health_monitor=False,
@@ -288,6 +296,26 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 for tid in mem.task_omega_snapshots:
                     s, e = tid * cpt, min((tid + 1) * cpt, fc.bias.shape[0])
                     cumulative[fc_b_id][s:e] = True
+
+        # (v) Path-Specific Normalization Lockdown:
+        # Lock BN running stats for sacred modules — prevents normalization
+        # statistics from drifting when new tasks train through the same layers.
+        # This is the "stabilized expert statistics" from the abstract.
+        for m_tracked in mem.models:
+            for name, module in m_tracked.named_modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    w_name = f"{name}.weight"
+                    if w_name in mem.sacred_mask and mem.sacred_mask[w_name].any():
+                        # Lock this BN module's running stats
+                        module.eval()  # freeze running_mean/running_var
+                        module.track_running_stats = True
+                        # Store running stats in anchor so they can be restored
+                        mean_key = f"{name}.running_mean"
+                        var_key  = f"{name}.running_var"
+                        if mean_key not in mem.anchor:
+                            mem.anchor[mean_key] = module.running_mean.clone().detach()
+                        if var_key not in mem.anchor:
+                            mem.anchor[var_key] = module.running_var.clone().detach()
 
         # Commit to both param_id_to_mask and sacred_mask
         mem.param_id_to_mask = {}
@@ -420,7 +448,11 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         )
 
         # Wrap train_step to add hard restoration after every optimizer step
+        # AND Latent Consistency Loss (component iii from abstract)
         _orig_train_step = model.train_step
+        # Capture task-0 feature anchor for consistency loss
+        _feature_anchor = {}  # will be populated after task 0
+
         def _hardened_train_step(self, x, target_data=None, **kwargs):
             res = _orig_train_step(x, target_data=target_data, **kwargs)
             if t_idx > 0 and sacred_anchors:
