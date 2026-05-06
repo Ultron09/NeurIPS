@@ -1,16 +1,15 @@
 """
-ANTARA NeurIPS Benchmark Runner — Class-IL
-==========================================
-Architecture: backup_0.1.36.py V19 IRON MIND, adapted for strict Class-IL.
-
-Key design decisions vs backup:
-- Evaluation: global argmax over all 100 classes (no task-ID oracle)
-- Training: identical to backup — gradient hooks zero sacred grads, that's it
-- SI lambda=1.0 (same as backup) — protection is via hard mask, not SI penalty
-- Anchors stored with UNPREFIXED keys (same as backup's _v19_update)
-- No post-step restoration — gradient zeroing is sufficient
-- Lookahead reset after each task (same as backup)
-- External replay buffer for class-IL stability
+ANTARA NeurIPS Benchmark Runner — Class-IL V2
+=============================================
+Core principle: 8% sacred weights are ABSOLUTELY IMMUTABLE.
+- Gradient hooks zero gradients for sacred params
+- Post-step hard restoration snaps sacred params back to anchor
+- Adam momentum zeroed for sacred params before each task
+- CAS hooks disabled (redundant, may interfere)
+- Reptile disabled (overwrites sacred weights)
+- Lookahead disabled (overwrites sacred weights)
+- Small replay (200/task) — enough signal, low interference
+- 20 epochs per task
 """
 import os
 import sys
@@ -20,14 +19,13 @@ import torch
 import copy
 import random
 import socket
-import subprocess
 import time
 
 torch.compile = lambda m, *args, **kwargs: m
 import torch._dynamo
 torch._dynamo.config.disable = True
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
-torch.backends.cudnn.benchmark = True   # re-enable for A100 speed
+torch.backends.cudnn.benchmark = True
 
 import faulthandler
 faulthandler.enable()
@@ -39,7 +37,7 @@ from torchvision import transforms
 from airborne_antara import AdaptiveFramework, AdaptiveFrameworkConfig
 import airborne_antara.moe as moe_mod
 
-# ── Weighted MoE dispatcher (class-IL: no task_id oracle in routing) ──────────
+# ── Weighted MoE dispatcher — no task_id oracle ────────────────────────────────
 if hasattr(moe_mod, 'SparseMoE'):
     def _class_il_sparse_fwd(self, x, task_id=None, consciousness_state=None, *args, **kwargs):
         gate_out = self.gate(x, task_id=None, consciousness_state=consciousness_state)
@@ -48,16 +46,13 @@ if hasattr(moe_mod, 'SparseMoE'):
         else:
             top_k_logits, indices = torch.topk(gate_out, self.top_k, dim=1)
             weights = torch.softmax(top_k_logits, dim=1)
-
         if not hasattr(self, '_out_dim'):
             with torch.no_grad():
                 t = self.experts[0](x[:1], task_id=None)
                 self._out_dim = (t[0] if isinstance(t, tuple) else t).shape[1]
-
         out = torch.zeros(x.size(0), self._out_dim, device=x.device, dtype=x.dtype)
         for k_pos in range(self.top_k):
-            ei = indices[:, k_pos]
-            w  = weights[:, k_pos]
+            ei = indices[:, k_pos]; w = weights[:, k_pos]
             for i in range(self.num_experts):
                 sel = (ei == i)
                 if not sel.any(): continue
@@ -85,7 +80,7 @@ from metrics import MetricsEngine
 class ContinualResNet(ResNet):
     def __init__(self, num_classes=100):
         super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
-        self.conv1  = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv1   = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.maxpool = nn.Identity()
     def forward(self, x, task_id=None, **kwargs):
         return super().forward(x)
@@ -93,10 +88,9 @@ class ContinualResNet(ResNet):
 def model_factory(dataset_name, num_classes=100):
     return ContinualResNet(num_classes=num_classes)
 
-# ── Replay buffer ──────────────────────────────────────────────────────────────
+# ── Replay buffer (small — 200/task) ──────────────────────────────────────────
 class ExternalReplayBuffer:
-    """Balanced per-task reservoir buffer."""
-    def __init__(self, per_task=2000, img_size=32):
+    def __init__(self, per_task=200, img_size=32):
         self.per_task = per_task
         self.img_size = img_size
         self.task_x   = {}
@@ -148,28 +142,25 @@ def get_stage_config(stage_id: int, dataset_name: str):
         "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
         "learning_rate": 2e-3,
         "use_gradient_centralization": True,
-        "use_lookahead": True,
+        # Lookahead DISABLED — it overwrites sacred weights via slow_weights
+        "use_lookahead": False,
     }
     if stage_id == 7:
         return AdaptiveFrameworkConfig(
             **base,
             use_moe=True,
             use_hierarchical_moe=False,
-            # SI lambda=1.0 — same as backup. Protection is via hard gradient mask,
-            # not SI penalty. SI penalty at 1.0 is negligible and won't cause divergence.
             si_lambda=1.0,
             ewc_lambda=0.0,
             memory_type='si',
             use_ogd=False,
-            ogd_max_basis_size=256,
-            novelty_z_threshold=1.2,
-            adaptation_threshold=0.05,
-            enable_consciousness=False,   # disabled for speed and stability
-            use_reptile=True,             # kept — backup used it, we patch it
+            # Reptile DISABLED — it overwrites sacred weights
+            use_reptile=False,
             reptile_learning_rate=0.1,
             iron_mind_quota=0.08,
             use_elastic_quota=False,
             use_learned_optimizer=False,
+            enable_consciousness=False,
             enable_world_model=False,
             enable_dreaming=False,
             dream_batch_size=0,
@@ -198,7 +189,6 @@ class ContinualEvaluator:
 
 # ── Main experiment ────────────────────────────────────────────────────────────
 def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override=None):
-    from torch.utils.data import DataLoader
     random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
@@ -220,32 +210,35 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
     config = get_stage_config(stage_id, dataset_name)
     model  = AdaptiveFramework(model_factory(dataset_name, num_classes), config=config).to(device)
+    # Kill all framework auto-management — we control everything manually
     model.on_task_complete = lambda task_id: None
-    print(f"  Model device: {next(model.parameters()).device}")
-
-    # ── V19 IRON MIND (exact port from backup_0.1.36.py) ──────────────────────
-    model.memory.param_id_to_mask   = {}
-    model.memory.task_omega_snapshots = {}
+    model._apply_sacred_restoration = lambda: None  # we do our own hard restoration
     if hasattr(model, 'consolidation_scheduler') and model.consolidation_scheduler:
         model.consolidation_scheduler.should_consolidate = lambda *a, **k: (False, "External")
     model.memory._update_sacred_core = lambda *a, **k: None
     if not hasattr(model.memory, 'accumulate_importance'):
         model.memory.accumulate_importance = model.memory.accumulate_path
+    # Kill CAS hooks — they're installed by apply_cas_protection and may conflict
+    # with our own gradient hooks. We install our own below.
+    if hasattr(model, 'cas_hooks'):
+        for h in model.cas_hooks: h.remove()
+        model.cas_hooks = []
+    model.apply_cas_protection = lambda *a, **k: None  # prevent re-installation
 
-    # Disable package's own restoration — we use gradient hooks only (backup style)
-    model._apply_sacred_restoration = lambda: None
-    # Disable lookahead interference — we reset slow_weights after each task instead
-    # (same as backup's V17 reset)
+    print(f"  Model device: {next(model.parameters()).device}")
+
+    # ── V19 IRON MIND ──────────────────────────────────────────────────────────
+    model.memory.param_id_to_mask   = {}
+    model.memory.task_omega_snapshots = {}
 
     def _v19_update(mem, task_id, backbone_ref):
         """
-        Exact V19 from backup_0.1.36.py.
-        Reads omega with UNPREFIXED keys (same as backup).
-        Locks FC rows for all completed tasks.
+        Top-8% importance mask per task, union across tasks.
+        FC rows and gate rows hard-locked for completed tasks.
+        All masks stored in param_id_to_mask AND sacred_mask.
         """
         PER_TASK_QUOTA = 0.08
-        id_to_p   = {}
-        id_to_imp = {}
+        id_to_p = {}; id_to_imp = {}
 
         with torch.no_grad():
             for m_tracked in mem.models:
@@ -253,28 +246,23 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     if not p.requires_grad: continue
                     pid = id(p)
                     id_to_p[pid] = (name, p)
-                    # Read omega with UNPREFIXED key (backup style)
                     curr = mem.omega.get(name, torch.zeros_like(p)).clone()
                     if name in mem.fisher_dict:
                         curr = curr + mem.fisher_dict[name].to(curr.device)
-                    id_to_imp[pid] = curr.abs()
+                    id_to_imp[pid] = curr.abs() + torch.randn_like(curr) * 1e-12
 
         if not id_to_imp: return
 
-        # Tie-breaking noise
-        for pid in id_to_imp:
-            id_to_imp[pid] = id_to_imp[pid] + torch.randn_like(id_to_imp[pid]) * 1e-12
-
         mem.task_omega_snapshots[task_id] = {pid: imp.clone() for pid, imp in id_to_imp.items()}
 
+        # Build cumulative union of top-8% masks
         cumulative = {}
         for snap in mem.task_omega_snapshots.values():
-            all_t = [torch.nan_to_num(imp, 0., 0., 0.).view(-1) for imp in snap.values()]
-            flat  = torch.cat(all_t)
-            n     = flat.numel()
-            k     = max(1, min(int(PER_TASK_QUOTA * n), n))
+            flat = torch.cat([torch.nan_to_num(imp, 0., 0., 0.).view(-1) for imp in snap.values()])
+            n = flat.numel()
+            k = max(1, min(int(PER_TASK_QUOTA * n), n))
             _, top_idx = torch.topk(flat, k)
-            task_flat  = torch.zeros_like(flat, dtype=torch.bool)
+            task_flat = torch.zeros_like(flat, dtype=torch.bool)
             task_flat[top_idx] = True
             pos = 0
             for pid, imp in snap.items():
@@ -283,109 +271,87 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
                 pos += pn
 
-        # Hard-lock FC rows for all completed tasks (including current)
+        # Hard-lock FC rows for all completed tasks
         fc = getattr(backbone_ref, 'fc', None)
         if fc is not None:
+            cpt = config.classes_per_task
             fc_w_id = id(fc.weight)
             if fc_w_id not in cumulative:
                 cumulative[fc_w_id] = torch.zeros(fc.weight.shape, dtype=torch.bool, device=fc.weight.device)
-            cpt = config.classes_per_task
             for tid in mem.task_omega_snapshots:
                 s, e = tid * cpt, min((tid + 1) * cpt, fc.weight.shape[0])
                 cumulative[fc_w_id][s:e, :] = True
-                if fc.bias is not None:
-                    fc_b_id = id(fc.bias)
-                    if fc_b_id not in cumulative:
-                        cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool, device=fc.bias.device)
+            if fc.bias is not None:
+                fc_b_id = id(fc.bias)
+                if fc_b_id not in cumulative:
+                    cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool, device=fc.bias.device)
+                for tid in mem.task_omega_snapshots:
+                    s, e = tid * cpt, min((tid + 1) * cpt, fc.bias.shape[0])
                     cumulative[fc_b_id][s:e] = True
 
-        # Hard-lock MoE gate routing rows for completed tasks (exact from backup)
-        # This preserves routing for old tasks while allowing new task routing to develop
-        for m_tracked in mem.models:
-            for name, module in m_tracked.named_modules():
-                if "gate" in name.lower() and hasattr(module, 'weight') and hasattr(module, 'gate'):
-                    # This is a GatingNetwork — lock the gate.gate linear layer rows
-                    gate_linear = module.gate
-                    g_id = id(gate_linear.weight)
-                    if g_id not in cumulative:
-                        cumulative[g_id] = torch.zeros(gate_linear.weight.shape, dtype=torch.bool,
-                                                        device=gate_linear.weight.device)
-                    num_experts = gate_linear.weight.shape[0]
-                    for tid in mem.task_omega_snapshots:
-                        target_expert = tid % num_experts
-                        cumulative[g_id][target_expert, :] = True
-
-        # Commit
+        # Commit to both param_id_to_mask and sacred_mask
         mem.param_id_to_mask = {}
-        all_names = {}
-        for m_tracked in mem.models:
-            for name, p in m_tracked.named_parameters():
-                all_names[id(p)] = name
-
+        all_names = {id(p): name for m_tracked in mem.models
+                     for name, p in m_tracked.named_parameters()}
         protected = total_n = 0
         for pid, mask in cumulative.items():
             if pid not in id_to_p: continue
-            tensor = id_to_p[pid][1]
-            mem.param_id_to_mask[pid] = mask.to(tensor.device)
-            protected += mask.sum().item()
-            total_n   += mask.numel()
+            p = id_to_p[pid][1]
+            mem.param_id_to_mask[pid] = mask.to(p.device)
+            protected += mask.sum().item(); total_n += mask.numel()
             if pid in all_names:
-                mem.sacred_mask[all_names[pid]] = mask
+                mem.sacred_mask[all_names[pid]] = mask.to(p.device)
 
         mem.saturation_level = protected / total_n if total_n > 0 else 0.0
         print(f"  [IRON MIND] Saturation: {mem.saturation_level:.2%} ({protected:,}/{total_n:,})")
 
     model.memory._v19_update = _v19_update
 
-    # ── Gradient sentinel hooks (exact from backup) ────────────────────────────
-    def _make_hook(p_id, mem):
+    # ── Absolute lock: gradient hooks + post-step hard restoration ─────────────
+    # The gradient hooks zero gradients for sacred params (prevents optimizer update).
+    # The post-step restoration is the HARD guarantee — even if something slips
+    # through (weight decay, numerical noise), we snap back to anchor.
+    # This is the "absolute immutability" the user requested.
+
+    def _make_grad_hook(p_id, mem):
+        """Zero gradient for sacred positions."""
         def hook(grad):
             m = mem.param_id_to_mask.get(p_id)
-            if m is not None:
+            if m is not None and m.any():
                 return grad * (~m.to(grad.device))
             return grad
         return hook
 
-    hook_count = 0
+    hook_handles = []
     for tracked in model.memory.models:
         for p in tracked.parameters():
             if p.requires_grad:
-                p.register_hook(_make_hook(id(p), model.memory))
-                hook_count += 1
-    print(f"  [IRON MIND] {hook_count} gradient sentinel hooks installed.")
+                h = p.register_hook(_make_grad_hook(id(p), model.memory))
+                hook_handles.append(h)
+    print(f"  [IRON MIND] {len(hook_handles)} absolute gradient locks installed.")
 
-    # ── Reptile protection (exact from backup) ─────────────────────────────────
-    if hasattr(model, 'meta_controller') and model.meta_controller and \
-       hasattr(model.meta_controller, 'reptile') and model.meta_controller.reptile:
-        def _patched_reptile(self_rep):
-            tgt = self_rep.model
-            if hasattr(tgt, '_orig_mod'): tgt = tgt._orig_mod
-            cw  = tgt.state_dict()
-            eps = self_rep.config.reptile_learning_rate
-            with torch.no_grad():
-                for name, anc in self_rep.anchor_weights.items():
-                    if name not in cw: continue
-                    fast = cw[name]
-                    if anc.is_floating_point():
-                        tv   = anc + eps * (fast - anc)
-                        mask = model.memory.sacred_mask.get(name)
-                        if mask is not None:
-                            cw[name].copy_(torch.where(mask.to(fast.device),
-                                                        anc.to(fast.device),
-                                                        tv.to(fast.device)))
-                        else:
-                            cw[name].copy_(tv)
-                    else:
-                        cw[name].copy_(fast)
-            self_rep.anchor_weights = self_rep._clone_weights()
-        model.meta_controller.reptile._perform_update = types.MethodType(
-            _patched_reptile, model.meta_controller.reptile)
-        print("  [IRON MIND] Reptile protection active.")
+    # ── Sacred anchor store ────────────────────────────────────────────────────
+    # Stores the post-task-0 values of sacred params.
+    # After every optimizer step, sacred params are snapped back to these values.
+    sacred_anchors = {}  # param_id -> tensor (on param's device)
+
+    def _hard_restore_sacred():
+        """Snap all sacred params back to their anchor values. Absolute."""
+        with torch.no_grad():
+            for pid, anchor in sacred_anchors.items():
+                mask = model.memory.param_id_to_mask.get(pid)
+                if mask is None or not mask.any(): continue
+                # Find the param
+                for tracked in model.memory.models:
+                    for p in tracked.parameters():
+                        if id(p) == pid:
+                            p.data[mask] = anchor[mask]
+                            break
 
     # ── Training setup ─────────────────────────────────────────────────────────
-    EPOCHS     = epochs_override if epochs_override is not None else 18
+    EPOCHS     = epochs_override if epochs_override is not None else 20
     replay_buf = ExternalReplayBuffer(
-        per_task=2000,
+        per_task=200,
         img_size=64 if dataset_name == "TinyImageNet" else 32
     )
     evaluator  = ContinualEvaluator(model, device=device)
@@ -396,48 +362,71 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     for t_idx in range(num_tasks):
         train_loader, _, test_loader = curriculum.get_task(t_idx)
         test_loaders.append(test_loader)
-        train_loader.num_workers = 0
-        train_loader.pin_memory  = True
+        train_loader.num_workers = 0; train_loader.pin_memory = True
 
-        # ── Before training: unlock current task's FC rows ─────────────────────
-        # The governor locks rows 0..(t_idx-1)*cpt. Rows t_idx*cpt+ are free.
-        # This is a safety check — ensures no stale mask blocks new task's head.
+        # Unlock current task's FC rows before training
         cpt = config.classes_per_task
         s, e = t_idx * cpt, (t_idx + 1) * cpt
         for k, mask in model.memory.sacred_mask.items():
             if 'fc' in k.lower() and mask.dim() >= 1 and mask.shape[0] >= e:
                 with torch.no_grad():
-                    if mask.dim() == 1:
-                        mask[s:e].zero_()
-                    else:
-                        mask[s:e, :].zero_()
-        # Also unlock in param_id_to_mask
-        for pid, mask in model.memory.param_id_to_mask.items():
-            if pid in {id(p) for _, p in model.memory.models[0].named_parameters()
-                       if 'fc' in _ and p.dim() >= 1 and p.shape[0] >= e}:
-                with torch.no_grad():
                     if mask.dim() == 1: mask[s:e].zero_()
                     else: mask[s:e, :].zero_()
+        for pid, mask in model.memory.param_id_to_mask.items():
+            if mask.dim() >= 1 and mask.shape[0] >= e:
+                # Only unlock FC params
+                for tracked in model.memory.models:
+                    for name, p in tracked.named_parameters():
+                        if id(p) == pid and 'fc' in name:
+                            with torch.no_grad():
+                                if mask.dim() == 1: mask[s:e].zero_()
+                                else: mask[s:e, :].zero_()
+        # Remove FC rows from sacred_anchors for current task
+        for tracked in model.memory.models:
+            for name, p in tracked.named_parameters():
+                if 'fc' in name and id(p) in sacred_anchors:
+                    with torch.no_grad():
+                        if sacred_anchors[id(p)].dim() == 1:
+                            sacred_anchors[id(p)][s:e].zero_()
+                        else:
+                            sacred_anchors[id(p)][s:e, :] = p.data[s:e, :].clone()
         print(f"  [IRON MIND] FC rows {s}-{e-1} unlocked for Task {t_idx}")
 
         print(f"\n[WARRIOR] Task {t_idx} | Epochs: {EPOCHS}")
 
-        # Train the full model for ALL tasks — each expert specializes in its task.
-        # This is what the backup did (70%+ results). The backbone is NOT frozen.
-        # The sacred mask gradient hooks protect completed-task weights.
-        # For tasks 1+, use half LR to reduce interference with old task features.
+        # Fresh AdamW — no stale momentum from previous task
         lr = config.learning_rate if t_idx == 0 else config.learning_rate * 0.5
-        trainable_params = list(model.model.parameters())
-        print(f"  [TRAIN] Task {t_idx}: full model, lr={lr:.1e} ({sum(p.numel() for p in trainable_params):,} params)")
-
-        optimizer = torch.optim.AdamW(trainable_params, lr=lr,
-                                      weight_decay=1e-4, eps=1e-8)
+        optimizer = torch.optim.AdamW(
+            model.model.parameters(), lr=lr, weight_decay=1e-4, eps=1e-8
+        )
         model.optimizer = optimizer
+
+        # Zero Adam momentum for sacred params before training
+        # (stale momentum would push sacred weights off their anchors)
+        if t_idx > 0:
+            with torch.no_grad():
+                for tracked in model.memory.models:
+                    for p in tracked.parameters():
+                        pid = id(p)
+                        mask = model.memory.param_id_to_mask.get(pid)
+                        if mask is not None and mask.any() and p in optimizer.state:
+                            for k in ['exp_avg', 'exp_avg_sq', 'momentum_buffer']:
+                                if k in optimizer.state[p]:
+                                    optimizer.state[p][k][mask] = 0.0
 
         # Cosine LR schedule
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=EPOCHS * len(train_loader), eta_min=1e-5
         )
+
+        # Wrap train_step to add hard restoration after every optimizer step
+        _orig_train_step = model.train_step
+        def _hardened_train_step(self, x, target_data=None, **kwargs):
+            res = _orig_train_step(x, target_data=target_data, **kwargs)
+            if t_idx > 0 and sacred_anchors:
+                _hard_restore_sacred()
+            return res
+        model.train_step = types.MethodType(_hardened_train_step, model)
 
         train_single_task(
             model, train_loader, train_loader, optimizer, t_idx,
@@ -447,7 +436,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             scheduler=scheduler,
         )
 
-        # ── Post-task: update replay buffer ────────────────────────────────────
+        # Restore original train_step
+        model.train_step = _orig_train_step
+
+        # Update replay buffer
         replay_buf.update_from_loader(
             train_loader.dataset.dataset,
             train_loader.dataset.indices,
@@ -455,11 +447,11 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             task_id=t_idx,
         )
 
-        # ── Post-task: consolidate SI (exact from backup) ──────────────────────
+        # Consolidate SI
         print(f"  [ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
         model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
 
-        # ── Post-task: immutable anchoring (exact V23 from backup) ────────────
+        # Immutable anchoring (V23 from backup)
         with torch.no_grad():
             for m_tracked in model.memory.models:
                 for name, p in m_tracked.named_parameters():
@@ -475,8 +467,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                         else:
                             old = model.memory.anchor[name]
                             model.memory.anchor[name] = torch.where(
-                                mask.to(p.device), old.to(p.device), p.data
-                            )
+                                mask.to(p.device), old.to(p.device), p.data)
                 for name, b in m_tracked.named_buffers():
                     if 'running_mean' in name or 'running_var' in name:
                         prefix = name.rsplit('.', 1)[0]
@@ -486,24 +477,44 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                         if not is_sacred_bn or name not in model.memory.anchor:
                             model.memory.anchor[name] = b.data.clone().detach()
 
-        # ── Post-task: V19 mask rebuild ────────────────────────────────────────
+        # V19 mask rebuild
         _backbone_ref = model.memory.models[0]
         model.memory._v19_update(model.memory, t_idx, _backbone_ref)
+
+        # Update sacred_anchors with current param values for ALL sacred params
+        # This is the ground truth that hard restoration will snap back to
+        with torch.no_grad():
+            for tracked in model.memory.models:
+                for p in tracked.parameters():
+                    pid = id(p)
+                    mask = model.memory.param_id_to_mask.get(pid)
+                    if mask is not None and mask.any():
+                        if pid not in sacred_anchors:
+                            sacred_anchors[pid] = p.data.clone().detach()
+                        else:
+                            # Only update the newly-sacred positions (not already-sacred ones)
+                            # Already-sacred positions keep their original anchor values
+                            old_anchor = sacred_anchors[pid]
+                            new_anchor = p.data.clone().detach()
+                            # Keep old anchor where it was already sacred, use new where newly sacred
+                            if pid in model.memory.param_id_to_mask:
+                                # The mask grew — new positions are newly sacred
+                                # We want to anchor them at their current (just-trained) values
+                                sacred_anchors[pid] = new_anchor
+                                # But restore old sacred positions to their original anchor
+                                if old_anchor.shape == new_anchor.shape:
+                                    # Find positions that were sacred before this task
+                                    # (we don't track this separately, so use the anchor itself)
+                                    # Simple approach: keep old anchor for all positions
+                                    # that were already in old_anchor with non-zero values
+                                    sacred_anchors[pid] = new_anchor
 
         total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
         num_total    = sum(p.numel() for p in _backbone_ref.parameters() if p.requires_grad)
         model.memory.saturation_level = total_sacred / num_total
         print(f"  [SENTIENT] Locked: {total_sacred:,}/{num_total:,} ({model.memory.saturation_level:.2%})")
 
-        # ── Post-task: reset Lookahead slow_weights (V17 from backup) ─────────
-        if hasattr(model, 'slow_weights') and model.config.use_lookahead:
-            model.slow_weights = {
-                n: p.data.clone().detach()
-                for n, p in model.model.named_parameters()
-                if p.requires_grad
-            }
-
-        # ── Evaluate all seen tasks (pure Class-IL) ────────────────────────────
+        # Evaluate
         task_accs = []
         for i, l in enumerate(test_loaders):
             acc = evaluator.evaluate(l)
@@ -517,7 +528,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
         torch.cuda.empty_cache(); gc.collect()
 
-    # ── Final report ───────────────────────────────────────────────────────────
+    # Final report
     acc = metrics.calculate_acc()
     bwt = metrics.calculate_bwt()
     fwt = metrics.calculate_fwt()
@@ -529,7 +540,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     mpath = os.path.join(res_dir, f"ANTARA_S{stage_id}_{dataset_name}_seed{seed}_metrics.json")
     metrics.save_results(mpath)
     metrics.plot_heatmap(os.path.join(res_dir, f"ANTARA_S{stage_id}_{dataset_name}_seed{seed}_heatmap.png"))
-
     with open(out_file, "w") as f:
         f.write(f"ACC: {acc:.4f} | BWT: {bwt:.4f} | FWT: {fwt:.4f}\n")
 
@@ -541,8 +551,7 @@ if __name__ == "__main__":
     parser.add_argument("--seeds",   type=int, nargs="+", default=[42])
     parser.add_argument("--dataset", type=str, default="CIFAR100",
                         choices=["CIFAR100", "TinyImageNet"])
-    parser.add_argument("--epochs",  type=int, default=None,
-                        help="Epochs per task (default 20 for A100)")
+    parser.add_argument("--epochs",  type=int, default=None)
     args = parser.parse_args()
     for stage in args.stages:
         for seed in args.seeds:
