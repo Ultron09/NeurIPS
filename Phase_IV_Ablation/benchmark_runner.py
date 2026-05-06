@@ -150,29 +150,27 @@ def get_stage_config(stage_id: int, dataset_name: str):
             **base,
             use_moe=True,
             use_hierarchical_moe=False,
-            # (iv) APR: Hybrid SI+EWC gives the strongest importance signal.
-            # SI tracks path integrals (gradient × weight change) — identifies
-            # weights that moved a lot during training (high plasticity).
-            # EWC Fisher identifies weights with high gradient variance (high sensitivity).
-            # Combined: we lock the weights that are BOTH sensitive AND heavily used.
+            # (iv) APR: Hybrid SI+EWC Fisher — strongest importance signal.
+            # Fisher computation is fast with small feedback_buffer_size=128.
             si_lambda=1.0,
-            ewc_lambda=400.0,          # Strong Fisher — identifies truly critical weights
-            memory_type='hybrid',      # SI + EWC combined importance
+            ewc_lambda=400.0,
+            memory_type='hybrid',
             use_ogd=False,
-            # Reptile DISABLED — overwrites sacred weights
             use_reptile=False,
             reptile_learning_rate=0.1,
             iron_mind_quota=0.08,
             use_elastic_quota=False,
             use_learned_optimizer=False,
-            # (i) Meta-Control Global Workspace — consciousness module
-            enable_consciousness=True,
-            # (iii) Latent Consistency Loss via World Model
-            enable_world_model=True,
-            world_model_loss_weight=0.1,
+            # Disabled for speed — Fisher is the priority importance signal
+            enable_consciousness=False,
+            enable_world_model=False,
+            world_model_loss_weight=0.0,
             enable_dreaming=False,
             dream_batch_size=0,
             enable_health_monitor=False,
+            # CRITICAL: Limit feedback buffer — Fisher only needs ~128 samples.
+            # Default 10000 causes Fisher to run 2500 backward passes = hangs.
+            feedback_buffer_size=128,
         )
     return AdaptiveFrameworkConfig(**base)
 
@@ -479,7 +477,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             task_id=t_idx,
         )
 
-        # Consolidate SI
+        # Consolidate SI + Fisher (hybrid)
+        # Fisher uses model.feedback_buffer — limited to 128 samples by config
         print(f"  [ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
         model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
 
