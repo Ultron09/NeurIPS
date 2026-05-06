@@ -4,5 +4,8 @@
         "python *",
         "Get-Content *",
         "Get-Children *"
-    ]
+    ],
+    "workbench.externalBrowser": "chrome",
+    "npm.enableRunFromFolder": true,
+    "kiroAgent.enableCodebaseIndexing": true
 }
