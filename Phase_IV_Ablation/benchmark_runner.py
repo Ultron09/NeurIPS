@@ -150,27 +150,23 @@ def get_stage_config(stage_id: int, dataset_name: str):
             **base,
             use_moe=True,
             use_hierarchical_moe=False,
-            # (iv) APR: Hybrid SI+EWC Fisher — strongest importance signal.
-            # Fisher computation is fast with small feedback_buffer_size=128.
+            # SI only — we compute Fisher ourselves (fast, vectorized)
             si_lambda=1.0,
-            ewc_lambda=400.0,
-            memory_type='hybrid',
+            ewc_lambda=0.0,
+            memory_type='si',
             use_ogd=False,
             use_reptile=False,
             reptile_learning_rate=0.1,
             iron_mind_quota=0.08,
             use_elastic_quota=False,
             use_learned_optimizer=False,
-            # Disabled for speed — Fisher is the priority importance signal
             enable_consciousness=False,
             enable_world_model=False,
             world_model_loss_weight=0.0,
             enable_dreaming=False,
             dream_batch_size=0,
             enable_health_monitor=False,
-            # CRITICAL: Limit feedback buffer — Fisher only needs ~128 samples.
-            # Default 10000 causes Fisher to run 2500 backward passes = hangs.
-            feedback_buffer_size=128,
+            feedback_buffer_size=64,
         )
     return AdaptiveFrameworkConfig(**base)
 
@@ -477,10 +473,52 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             task_id=t_idx,
         )
 
-        # Consolidate SI + Fisher (hybrid)
-        # Fisher uses model.feedback_buffer — limited to 128 samples by config
-        print(f"  [ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
+        # ── Fast Fisher + SI consolidation (bypasses slow package consolidate) ──
+        # The package's consolidate with hybrid mode runs 2500+ backward passes.
+        # We compute Fisher ourselves: one vectorized backward pass over 64 samples.
+        print(f"  [ANTARA] Task {t_idx} complete. Computing importance (fast Fisher+SI)...")
+
+        # Step 1: SI consolidation only (fast — no backward pass needed)
         model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
+
+        # Step 2: Fast diagonal Fisher on replay buffer (64 samples, one batch)
+        if t_idx == 0 or len(replay_buf) > 0:
+            _backbone = model.memory.models[0]
+            _backbone.eval()
+            # Sample up to 64 items from replay buffer (or current task loader)
+            if t_idx == 0:
+                # Use a small subset of the current task's training data
+                _fisher_x, _fisher_y = [], []
+                for _bx, _by in train_loader:
+                    _fisher_x.append(_bx); _fisher_y.append(_by)
+                    if sum(t.size(0) for t in _fisher_x) >= 64: break
+                _fisher_x = torch.cat(_fisher_x)[:64].to(device).float()
+                _fisher_y = torch.cat(_fisher_y)[:64].to(device)
+            else:
+                _fx, _fy = replay_buf.sample(64)
+                _fisher_x = _fx.to(device).float() if _fx is not None else None
+                _fisher_y = _fy.to(device) if _fy is not None else None
+
+            if _fisher_x is not None:
+                # Single forward+backward to get gradient²  (diagonal Fisher)
+                _backbone.zero_grad()
+                with torch.enable_grad():
+                    _out = _backbone(_fisher_x)
+                    if isinstance(_out, tuple): _out = _out[0]
+                    _loss = F.cross_entropy(_out, _fisher_y)
+                    _loss.backward()
+
+                with torch.no_grad():
+                    for name, p in _backbone.named_parameters():
+                        if p.requires_grad and p.grad is not None:
+                            # Fisher diagonal = grad²
+                            fisher_diag = p.grad.data.pow(2)
+                            # Add to omega (SI already accumulated there)
+                            existing = model.memory.omega.get(name, torch.zeros_like(p))
+                            model.memory.omega[name] = existing + fisher_diag * 400.0
+                _backbone.zero_grad()
+                _backbone.train()
+                print(f"  [FISHER] Fast diagonal Fisher computed on {_fisher_x.size(0)} samples.")
 
         # Immutable anchoring (V23 from backup)
         with torch.no_grad():
