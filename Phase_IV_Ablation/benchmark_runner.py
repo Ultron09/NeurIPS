@@ -15,7 +15,6 @@ Core principle: 8% sacred weights are ABSOLUTELY IMMUTABLE.
 import os
 import sys
 import gc
-import types
 import torch
 import copy
 import random
@@ -215,7 +214,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     model  = AdaptiveFramework(model_factory(dataset_name, num_classes), config=config).to(device)
     # Kill all framework auto-management — we control everything manually
     model.on_task_complete = lambda task_id: None
-    model._apply_sacred_restoration = lambda: None  # we do our own hard restoration
     if hasattr(model, 'consolidation_scheduler') and model.consolidation_scheduler:
         model.consolidation_scheduler.should_consolidate = lambda *a, **k: (False, "External")
     model.memory._update_sacred_core = lambda *a, **k: None
@@ -386,6 +384,14 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             for p, mask, anchor in sacred_restore_list:
                 p.data[mask] = anchor[mask]
 
+    # Re-wire the framework's _apply_sacred_restoration to use our sacred_restore_list.
+    # The framework calls this in 3 places inside train_step (post-optimizer, post-dream,
+    # post-replay). We must hook all 3 sites — wrapping train_step only catches the final
+    # return, missing the intermediate restorations.
+    def _framework_sacred_restore(self_model=None):
+        _hard_restore_sacred()
+    model._apply_sacred_restoration = _framework_sacred_restore
+
     # ── Training setup ─────────────────────────────────────────────────────────
     EPOCHS     = epochs_override if epochs_override is not None else 20
     replay_buf = ExternalReplayBuffer(
@@ -448,19 +454,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             optimizer, T_max=EPOCHS * len(train_loader), eta_min=1e-5
         )
 
-        # Wrap train_step to add hard restoration after every optimizer step
-        # AND Latent Consistency Loss (component iii from abstract)
-        _orig_train_step = model.train_step
-        # Capture task-0 feature anchor for consistency loss
-        _feature_anchor = {}  # will be populated after task 0
-
-        def _hardened_train_step(self, x, target_data=None, **kwargs):
-            res = _orig_train_step(x, target_data=target_data, **kwargs)
-            if t_idx > 0 and sacred_restore_list:
-                _hard_restore_sacred()
-            return res
-        model.train_step = types.MethodType(_hardened_train_step, model)
-
         train_single_task(
             model, train_loader, train_loader, optimizer, t_idx,
             device=device, epochs=EPOCHS,
@@ -468,9 +461,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             label_smoothing=0.05 if t_idx == 0 else 0.1,
             scheduler=scheduler,
         )
-
-        # Restore original train_step
-        model.train_step = _orig_train_step
 
         # Update replay buffer
         replay_buf.update_from_loader(
