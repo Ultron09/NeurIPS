@@ -410,10 +410,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         _hard_restore_sacred()
     model._apply_sacred_restoration = _framework_sacred_restore
 
-    # Patch gradient centralization to re-zero sacred gradients after mean subtraction.
-    # GC computes grad -= mean(grad) AFTER our hooks have zeroed sacred positions,
-    # which re-introduces non-zero gradients at sacred positions (mean of a row with
-    # some zeros is non-zero, so 0 - mean != 0). We re-zero after GC runs.
+    # Patch gradient centralization AND gradient noise injection to re-zero
+    # sacred gradients after each operation.
+    # Both run AFTER backward() hooks have zeroed sacred grads, and BEFORE
+    # optimizer.step() — so they can re-introduce gradients at sacred positions.
     _orig_gc = model._apply_gradient_centralization
     def _gc_with_sacred_zero(self_model=None):
         _orig_gc()
@@ -425,6 +425,16 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 if mask is not None and mask.any():
                     p.grad.data[mask] = 0.0
     model._apply_gradient_centralization = _gc_with_sacred_zero
+
+    # Patch the gradient noise injection (lines 177-182 in core.py train_step).
+    # It adds randn noise to ALL gradients for first 100 steps of each task,
+    # which re-introduces noise at sacred positions after hooks zeroed them.
+    # We neutralize it by zeroing sacred positions after the noise is added.
+    # We do this by patching the forward method to install a post-backward hook
+    # that fires AFTER the noise injection but BEFORE unscale_.
+    # The cleanest approach: override _steps_since_task_start to always be >= 100
+    # so the noise injection condition (steps_since_start < 100) is never true.
+    model._steps_since_task_start = 100  # disable noise injection permanently
 
     # ── Training setup ─────────────────────────────────────────────────────────
     EPOCHS     = epochs_override if epochs_override is not None else 20
@@ -470,6 +480,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         print(f"  [IRON MIND] FC rows {s}-{e-1} unlocked for Task {t_idx}")
 
         print(f"\n[WARRIOR] Task {t_idx} | Epochs: {EPOCHS}")
+
+        # Disable gradient noise injection for this task
+        # (noise is added to ALL grads including sacred positions)
+        model._steps_since_task_start = 100  # keeps condition steps_since_start < 100 False
 
         # Fresh AdamW — no stale momentum from previous task
         lr = config.learning_rate if t_idx == 0 else config.learning_rate * 0.5
@@ -677,10 +691,13 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         print(f"  [SENTIENT] Locked: {total_sacred:,}/{num_total:,} ({model.memory.saturation_level:.2%})")
 
         # ── Save frozen backbone after Task 0 for Latent Consistency Loss ──────
-        # This is z₀(x) in the stability bound — the reference feature extractor
-        # whose output we anchor all subsequent tasks against.
+        # deepcopy fails on non-leaf tensors (weight_norm / AMP graph nodes).
+        # Instead: instantiate a fresh backbone and load the state dict.
         if t_idx == 0:
-            _frozen_backbone = copy.deepcopy(model.memory.models[0])
+            _frozen_backbone = model_factory(dataset_name, num_classes).to(device)
+            _frozen_backbone.load_state_dict(
+                model.memory.models[0].state_dict(), strict=False
+            )
             _frozen_backbone.eval()
             for _p in _frozen_backbone.parameters():
                 _p.requires_grad = False
