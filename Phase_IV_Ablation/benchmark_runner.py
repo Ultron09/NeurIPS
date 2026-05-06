@@ -114,6 +114,15 @@ class ContinualEvaluator:
     def evaluate(self, loader):
         self.model.eval()
         correct = total = 0
+        # Disable Sentient Affine Modifiers during evaluation.
+        # The introspection engine learns task-specific scale/shift modifiers
+        # applied to every layer output via forward hooks (line 1051 in core.py:
+        # inp = inp * scale + shift). After Task N trains, these modifiers are
+        # calibrated for Task N's distribution — applying them to Task 0 inputs
+        # amplifies Task N logits 2-3x, causing 0% Task 0 accuracy despite
+        # frozen FC weights and frozen BN stats.
+        saved_modifiers = getattr(self.model, 'current_modifiers', None)
+        self.model.current_modifiers = None
         with torch.inference_mode():
             for x, y in loader:
                 x = x.to(self.device).float()
@@ -122,6 +131,7 @@ class ContinualEvaluator:
                 if isinstance(logits, tuple): logits = logits[0]
                 correct += (logits.argmax(1) == y).sum().item()
                 total   += y.size(0)
+        self.model.current_modifiers = saved_modifiers
         return correct / total if total > 0 else 0.0
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -141,14 +151,14 @@ def get_stage_config(stage_id: int, dataset_name: str):
         "learning_rate": 2e-3,
         "ewc_lambda": 0.0,
         "si_lambda": 1.0,
-        "use_reptile": True,            # Reptile meta-learning
+        "use_reptile": True,
         "reptile_learning_rate": 0.1,
         "use_learned_optimizer": False,
         "novelty_z_threshold": 1.2,
         "adaptation_threshold": 0.05,
         "use_gradient_centralization": True,
-        "use_lookahead": True,          # Lookahead optimizer
-        "use_ogd": True,                # Gradient projection — key anti-forgetting mechanism
+        "use_lookahead": True,
+        "use_ogd": True,
         "ogd_max_basis_size": 256,
         "memory_type": "si",
         "use_elastic_quota": False,
@@ -213,7 +223,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         Flat 8% quota for all tasks — OGD handles forgetting via gradient projection.
         FC rows, gate rows, and early backbone layers hard-locked.
         """
-        PER_TASK_QUOTA = 0.08
+        PER_TASK_QUOTA = 0.30 if task_id == 0 else 0.08
         _task_quota_registry[task_id] = PER_TASK_QUOTA
 
         id_to_p = {}; id_to_imp = {}
@@ -398,7 +408,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     model._steps_since_task_start = 100
 
     # ── Training setup ─────────────────────────────────────────────────────────
-    EPOCHS     = epochs_override if epochs_override is not None else 10  # matches backup
+    EPOCHS     = epochs_override if epochs_override is not None else 20  # more training per task
     evaluator  = ContinualEvaluator(model, device=device)
     metrics    = MetricsEngine(num_tasks=num_tasks,
                                config_name=f"ANTARA_S{stage_id}_{dataset_name}_seed{seed}")
@@ -624,12 +634,15 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # Debug: check logit distribution for Task 0 after Task 1
         if t_idx == 1:
             model.eval()
+            saved_mods = getattr(model, 'current_modifiers', None)
+            model.current_modifiers = None
             sample_x, sample_y = next(iter(test_loaders[0]))
             sample_x = sample_x[:8].to(device).float()
             sample_y = sample_y[:8].to(device)
             with torch.inference_mode():
                 logits = model.inference_step(sample_x)
                 if isinstance(logits, tuple): logits = logits[0]
+            model.current_modifiers = saved_mods
             print(f"  [DEBUG] Task 0 test sample labels: {sample_y.tolist()}")
             print(f"  [DEBUG] Logits shape: {logits.shape}")
             print(f"  [DEBUG] Predicted classes: {logits.argmax(1).tolist()}")

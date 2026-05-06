@@ -98,10 +98,13 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                         else:
                             logits = model(x_mix.float(), task_id=t_idx) if is_antara else model(x_mix.float())
                         
-                        # [BUGFIX] Logit Masking to prevent representation scrambling against locked FC heads
+                        # [BUGFIX] Logit Detachment to prevent scrambling AND logit imbalance
                         if t_idx > 0:
                             mask_limit = t_idx * (seen_classes // (t_idx + 1))
-                            logits[:, :mask_limit] = -float('inf')
+                            logits = torch.cat([
+                                logits[:, :mask_limit].detach(),
+                                logits[:, mask_limit:]
+                            ], dim=1)
                             
                         loss = lam * F.cross_entropy(logits[:, :seen_classes], y_a, label_smoothing=label_smoothing) + \
                                (1 - lam) * F.cross_entropy(logits[:, :seen_classes], y_b, label_smoothing=label_smoothing)
@@ -114,10 +117,13 @@ def train_single_task(model, train_loader, val_loader, optimizer, t_idx, device=
                         else:
                             logits = model(x.float(), task_id=t_idx) if is_antara else model(x.float())
                             
-                            # [BUGFIX] Logit Masking
+                            # [BUGFIX] Logit Detachment to prevent scrambling AND logit imbalance
                             if t_idx > 0:
                                 mask_limit = t_idx * (seen_classes // (t_idx + 1))
-                                logits[:, :mask_limit] = -float('inf')
+                                logits = torch.cat([
+                                    logits[:, :mask_limit].detach(),
+                                    logits[:, mask_limit:]
+                                ], dim=1)
                                 
                             loss = F.cross_entropy(logits[:, :seen_classes], y, label_smoothing=label_smoothing)
 
