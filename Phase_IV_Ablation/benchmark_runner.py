@@ -52,7 +52,11 @@ if hasattr(moe_mod, 'SparseMoE'):
             weights = torch.softmax(top_k_logits, dim=1)
         if not hasattr(self, '_out_dim'):
             with torch.no_grad():
-                t = self.experts[0](x[:1], task_id=None)
+                _was_training = self.experts[0].training
+                self.experts[0].eval()
+                t = self.experts[0](x[:2], task_id=None)
+                if _was_training:
+                    self.experts[0].train()
                 self._out_dim = (t[0] if isinstance(t, tuple) else t).shape[1]
         out = torch.zeros(x.size(0), self._out_dim, device=x.device, dtype=x.dtype)
 
