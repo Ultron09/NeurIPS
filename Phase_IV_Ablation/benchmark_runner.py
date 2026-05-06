@@ -110,6 +110,24 @@ def _get_resnet_backbone(framework_model):
         return m
     raise RuntimeError(f"Cannot find ContinualResNet backbone in {type(m).__name__}")
 
+def _get_all_expert_backbones(framework_model):
+    """
+    Return all ContinualResNet backbones from all MoE experts.
+    Each expert is independent — we must anchor ALL of them.
+    """
+    m = framework_model.model
+    if hasattr(m, 'experts'):
+        backbones = []
+        for expert in m.experts:
+            if hasattr(expert, 'model') and hasattr(expert.model, 'conv1'):
+                backbones.append(expert.model)
+        if backbones:
+            return backbones
+    # Fallback: single backbone
+    if hasattr(m, 'conv1'):
+        return [m]
+    return [_get_resnet_backbone(framework_model)]
+
 def _extract_features(backbone, x):
     """
     Extract penultimate-layer features (avgpool output, before FC).
@@ -464,8 +482,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     # Component (iii) from the ANTARA abstract: anchors internal representations
     # against distributional drift. Directly minimises δ = sup‖z(x)−z₀(x)‖
     # from the stability bound. α controls the consistency coefficient.
-    _frozen_backbone = None   # set after Task 0
-    _LC_ALPHA        = 2.0    # α in the stability bound — tuned for CIFAR-100
+    # _frozen_experts: list of frozen ContinualResNet copies, one per MoE expert.
+    # Updated after each task to anchor ALL seen tasks' feature spaces.
+    _frozen_experts = []   # list of frozen ContinualResNet per expert
+    _LC_ALPHA        = 5.0    # α in the stability bound — stronger signal needed
     _LC_BATCH        = 128    # replay samples per LCL backward pass
     replay_buf = ExternalReplayBuffer(
         per_task=500,
@@ -542,27 +562,28 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
         def _lcl_train_step(self_fw, x, target_data=None, **kwargs):
             res = _orig_train_step(x, target_data=target_data, **kwargs)
-            # Only apply LCL on tasks after Task 0, when frozen backbone exists
-            if _frozen_backbone is not None and replay_buf and len(replay_buf) > 0:
+            # Only apply LCL when frozen anchors exist and replay buffer has data
+            if _frozen_experts and replay_buf and len(replay_buf) > 0:
                 rx, ry = replay_buf.sample(_LC_BATCH)
                 if rx is not None:
                     rx = rx.to(device).float()
-                    # Frozen reference features — no grad
-                    with torch.no_grad():
-                        z_frozen = _extract_features(_frozen_backbone, rx)
-                    # Current features — with grad through free weights
-                    # Navigate SparseMoE → experts[0].model to get ContinualResNet
-                    _backbone_live = _get_resnet_backbone(model)
-                    _backbone_live.train()
-                    z_current = _extract_features(_backbone_live, rx)
-                    # LCL = α · mean(1 - cosine_similarity(z_current, z_frozen))
-                    # This is the δ-minimisation term from the stability bound
-                    lc_loss = _LC_ALPHA * (
-                        1.0 - F.cosine_similarity(z_current, z_frozen, dim=1)
-                    ).mean()
+                    live_experts = _get_all_expert_backbones(model)
+                    total_lc = torch.tensor(0.0, device=device)
+                    for exp_idx, (frozen_exp, live_exp) in enumerate(
+                            zip(_frozen_experts, live_experts)):
+                        # Frozen reference features — no grad
+                        with torch.no_grad():
+                            z_frozen = _extract_features(frozen_exp, rx)
+                        # Current features — with grad through free weights
+                        live_exp.train()
+                        z_current = _extract_features(live_exp, rx)
+                        # LCL = α · mean(1 - cosine_similarity(z_current, z_frozen))
+                        total_lc = total_lc + (
+                            1.0 - F.cosine_similarity(z_current, z_frozen, dim=1)
+                        ).mean()
+                    lc_loss = _LC_ALPHA * total_lc / max(1, len(_frozen_experts))
                     lc_loss.backward()
                     # Re-zero sacred gradients after LCL backward
-                    # (LCL backward can re-introduce gradients at sacred positions)
                     with torch.no_grad():
                         for pid, p in _pid_to_param.items():
                             if p.grad is None: continue
@@ -712,18 +733,41 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         model.memory.saturation_level = total_sacred / num_total
         print(f"  [SENTIENT] Locked: {total_sacred:,}/{num_total:,} ({model.memory.saturation_level:.2%})")
 
-        # ── Save frozen backbone after Task 0 for Latent Consistency Loss ──────
-        # model.model is SparseMoE when use_moe=True; the ContinualResNet lives
-        # at experts[0].model. We copy weights via state_dict to avoid deepcopy
-        # issues with non-leaf AMP graph tensors.
-        if t_idx == 0:
-            _live_resnet = _get_resnet_backbone(model)
-            _frozen_backbone = model_factory(dataset_name, num_classes).to(device)
-            _frozen_backbone.load_state_dict(_live_resnet.state_dict(), strict=False)
-            _frozen_backbone.eval()
-            for _p in _frozen_backbone.parameters():
-                _p.requires_grad = False
-            print("  [LCL] Task-0 feature anchor frozen. δ-minimisation active from Task 1.")
+        # ── Update frozen expert anchors after each task ──────────────────────
+        # Capture ALL expert backbones as frozen anchors.
+        # After Task 0: anchor = Task 0 features for all experts.
+        # After Task N: anchor = best-so-far features (Task 0 anchors preserved
+        # for expert positions that were sacred; new positions get Task N values).
+        # This ensures LCL anchors ALL seen tasks, not just Task 0.
+        _live_experts = _get_all_expert_backbones(model)
+        if not _frozen_experts:
+            # First time: create frozen copies for all experts
+            for live_exp in _live_experts:
+                frozen = model_factory(dataset_name, num_classes).to(device)
+                frozen.load_state_dict(live_exp.state_dict(), strict=False)
+                frozen.eval()
+                for _p in frozen.parameters():
+                    _p.requires_grad = False
+                _frozen_experts.append(frozen)
+            print(f"  [LCL] {len(_frozen_experts)} expert anchors frozen after Task {t_idx}.")
+        else:
+            # Update: for each expert, update only the NON-sacred positions
+            # (sacred positions keep their original Task 0 anchor values)
+            for exp_idx, (frozen_exp, live_exp) in enumerate(
+                    zip(_frozen_experts, _live_experts)):
+                with torch.no_grad():
+                    for (fname, fp), (lname, lp) in zip(
+                            frozen_exp.named_parameters(),
+                            live_exp.named_parameters()):
+                        # Only update non-sacred positions in the frozen anchor
+                        mask = model.memory.sacred_mask.get(fname)
+                        if mask is None:
+                            fp.data.copy_(lp.data)
+                        else:
+                            # Keep sacred positions frozen, update free positions
+                            fp.data[~mask] = lp.data[~mask]
+            print(f"  [LCL] Expert anchors updated after Task {t_idx} "
+                  f"(free positions refreshed, sacred positions held).")
 
         # Evaluate
         task_accs = []
