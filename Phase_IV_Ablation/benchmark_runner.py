@@ -148,7 +148,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
         "adaptation_threshold": 0.05,
         "use_gradient_centralization": True,
         "use_lookahead": True,          # Lookahead optimizer
-        "use_ogd": True,                # Gradient projection
+        "use_ogd": True,                # Gradient projection — key anti-forgetting mechanism
         "ogd_max_basis_size": 256,
         "memory_type": "si",
         "use_elastic_quota": False,
@@ -210,14 +210,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     def _v19_update(mem, task_id, backbone_ref):
         """
         Top-K importance mask per task, union across tasks.
-        Task 0 gets 50% quota to protect the backbone feature extractor.
-        Subsequent tasks get 8% each.
+        Flat 8% quota for all tasks — OGD handles forgetting via gradient projection.
         FC rows, gate rows, and early backbone layers hard-locked.
         """
-        # Task 0 needs a much larger quota — it trains the backbone from scratch.
-        # The backbone features must be preserved for all future tasks.
-        # 50% ensures the critical feature detectors are locked before Task 1.
-        PER_TASK_QUOTA = 0.50 if task_id == 0 else 0.08
+        PER_TASK_QUOTA = 0.08
         _task_quota_registry[task_id] = PER_TASK_QUOTA
 
         id_to_p = {}; id_to_imp = {}
