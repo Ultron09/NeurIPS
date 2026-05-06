@@ -408,15 +408,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                             with torch.no_grad():
                                 if mask.dim() == 1: mask[s:e].zero_()
                                 else: mask[s:e, :].zero_()
-        # Remove FC rows from sacred_anchors for current task
-        for tracked in model.memory.models:
-            for name, p in tracked.named_parameters():
-                if 'fc' in name and id(p) in sacred_anchors:
-                    with torch.no_grad():
-                        if sacred_anchors[id(p)].dim() == 1:
-                            sacred_anchors[id(p)][s:e].zero_()
-                        else:
-                            sacred_anchors[id(p)][s:e, :] = p.data[s:e, :].clone()
         print(f"  [IRON MIND] FC rows {s}-{e-1} unlocked for Task {t_idx}")
 
         print(f"\n[WARRIOR] Task {t_idx} | Epochs: {EPOCHS}")
