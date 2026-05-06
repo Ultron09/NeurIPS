@@ -506,7 +506,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         model.memory.saturation_level = total_sacred / num_total
         print(f"  [SENTIENT] Locked: {total_sacred:,}/{num_total:,} ({model.memory.saturation_level:.2%})")
 
-        # V17 Reset Lookahead slow_weights after consolidation
+        # V17 Reset Lookahead slow_weights AND Reptile anchor_weights after consolidation
+        # Prevents stale weights from overwriting sacred coordinates on next task
         if hasattr(model, 'slow_weights') and config.use_lookahead:
             model.slow_weights = {
                 n: p.data.clone().detach()
@@ -514,6 +515,18 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 if p.requires_grad
             }
             print(f"  [LOOKAHEAD] Slow weights re-synced after Task {t_idx}.")
+
+        if (hasattr(model, 'meta_controller') and
+                hasattr(model.meta_controller, 'reptile') and
+                model.meta_controller.reptile is not None):
+            rep = model.meta_controller.reptile
+            # Re-anchor to current post-consolidation weights
+            # so Reptile doesn't pull sacred weights back to pre-task values
+            rep.anchor_weights = {
+                k: v.clone().detach()
+                for k, v in model.model.state_dict().items()
+            }
+            print(f"  [REPTILE] Anchor weights re-synced after Task {t_idx}.")
 
         # Evaluate
         task_accs = []
