@@ -422,31 +422,13 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
         print(f"\n[WARRIOR] Task {t_idx} | Epochs: {EPOCHS}")
 
-        if t_idx == 0:
-            # Task 0: train the full model — backbone + FC head rows 0-9
-            lr = config.learning_rate
-            trainable_params = list(model.model.parameters())
-            print(f"  [TRAIN] Task 0: full model training ({sum(p.numel() for p in trainable_params):,} params)")
-        else:
-            # Tasks 1+: freeze backbone, only train current task's FC rows + gate
-            # This is the correct class-IL strategy — backbone features are stable,
-            # new tasks only need to learn their classifier rows.
-            # The sacred mask gradient hooks already protect old FC rows.
-            lr = config.learning_rate  # full LR since fewer params are being trained
-            backbone = model.memory.models[0]  # the ContinualResNet
-            # Collect only: current task's FC rows + gate params (plastic)
-            trainable_params = []
-            for name, p in backbone.named_parameters():
-                if 'fc' in name:
-                    # Only include FC weight/bias — gradient hooks protect old rows
-                    trainable_params.append(p)
-                elif 'gate' in name.lower():
-                    trainable_params.append(p)
-            # Also include adapter params if any
-            if hasattr(model, 'adapter_bank') and model.adapter_bank:
-                trainable_params += list(model.adapter_bank.parameters())
-            n_trainable = sum(p.numel() for p in trainable_params)
-            print(f"  [TRAIN] Task {t_idx}: head+gate only ({n_trainable:,} params, backbone frozen)")
+        # Train the full model for ALL tasks — each expert specializes in its task.
+        # This is what the backup did (70%+ results). The backbone is NOT frozen.
+        # The sacred mask gradient hooks protect completed-task weights.
+        # For tasks 1+, use half LR to reduce interference with old task features.
+        lr = config.learning_rate if t_idx == 0 else config.learning_rate * 0.5
+        trainable_params = list(model.model.parameters())
+        print(f"  [TRAIN] Task {t_idx}: full model, lr={lr:.1e} ({sum(p.numel() for p in trainable_params):,} params)")
 
         optimizer = torch.optim.AdamW(trainable_params, lr=lr,
                                       weight_decay=1e-4, eps=1e-8)
