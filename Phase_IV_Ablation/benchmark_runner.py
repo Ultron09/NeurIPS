@@ -236,13 +236,12 @@ class ExternalReplayBuffer:
 # ── Config ─────────────────────────────────────────────────────────────────────
 def get_stage_config(stage_id: int, dataset_name: str):
     base = {
-        "model_dim": 256, "num_experts": 10, "experts_per_domain": 4,
+        "model_dim": 256, "num_experts": 20, "experts_per_domain": 4,
         "top_k_experts": 2,
         "input_dim": 12288 if dataset_name == "TinyImageNet" else 3072,
         "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
         "learning_rate": 2e-3,
         "use_gradient_centralization": True,
-        # Lookahead DISABLED — overwrites sacred weights via slow_weights
         "use_lookahead": False,
     }
     if stage_id == 7:
@@ -538,8 +537,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     # With 10 experts and 10 tasks, each task gets ~1 dedicated expert.
     _task_expert_map = {}   # task_id -> list of frozen expert indices
     _EXPERTS_PER_TASK = 2   # freeze 2 experts per task — matches top_k=2
-    # With 10 experts and top_k=2: tasks 0-4 get 2 dedicated experts each (5 tasks)
-    # Tasks 5-9 share the remaining experts with replay-based protection
+    # With 20 experts and top_k=2: 10 tasks × 2 experts = perfect 1:1 coverage
+    # Every task gets 2 fully dedicated experts, zero sharing
     _moe = model.model if hasattr(model.model, 'experts') else None
     print(f"  [MoE] model.model type: {type(model.model).__name__}, _moe set: {_moe is not None}")
 
