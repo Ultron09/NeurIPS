@@ -88,6 +88,24 @@ class ContinualResNet(ResNet):
 def model_factory(dataset_name, num_classes=100):
     return ContinualResNet(num_classes=num_classes)
 
+# ── Latent Consistency Loss helpers ───────────────────────────────────────────
+def _extract_features(backbone, x):
+    """
+    Extract penultimate-layer features (avgpool output, before FC).
+    This is z(x) in the stability bound: δ = sup‖z(x) − z₀(x)‖.
+    Works with ContinualResNet (standard ResNet-18 layout).
+    """
+    x = backbone.conv1(x)
+    x = backbone.bn1(x)
+    x = backbone.relu(x)
+    x = backbone.maxpool(x)
+    x = backbone.layer1(x)
+    x = backbone.layer2(x)
+    x = backbone.layer3(x)
+    x = backbone.layer4(x)
+    x = backbone.avgpool(x)
+    return torch.flatten(x, 1)   # (B, 512)
+
 # ── Replay buffer (small — 200/task) ──────────────────────────────────────────
 class ExternalReplayBuffer:
     def __init__(self, per_task=200, img_size=32):
@@ -410,6 +428,14 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
     # ── Training setup ─────────────────────────────────────────────────────────
     EPOCHS     = epochs_override if epochs_override is not None else 20
+
+    # ── Latent Consistency Loss state ──────────────────────────────────────────
+    # Component (iii) from the ANTARA abstract: anchors internal representations
+    # against distributional drift. Directly minimises δ = sup‖z(x)−z₀(x)‖
+    # from the stability bound. α controls the consistency coefficient.
+    _frozen_backbone = None   # set after Task 0
+    _LC_ALPHA        = 2.0    # α in the stability bound — tuned for CIFAR-100
+    _LC_BATCH        = 128    # replay samples per LCL backward pass
     replay_buf = ExternalReplayBuffer(
         per_task=500,
         img_size=64 if dataset_name == "TinyImageNet" else 32
@@ -470,6 +496,50 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             optimizer, T_max=EPOCHS * len(train_loader), eta_min=1e-5
         )
 
+        # ── Latent Consistency Loss injection ─────────────────────────────────
+        # Wrap train_step to add LCL backward after each optimizer step.
+        # LCL directly minimises δ = sup‖z(x)−z₀(x)‖ from the stability bound
+        # by penalising feature drift on replay samples.
+        # This constrains the FREE (non-sacred) weights — the confirmed source
+        # of forgetting (sacred drift = 0.000000, confirmed by diagnostic).
+        import types as _types
+        _orig_train_step = model.train_step
+
+        def _lcl_train_step(self_fw, x, target_data=None, **kwargs):
+            res = _orig_train_step(x, target_data=target_data, **kwargs)
+            # Only apply LCL on tasks after Task 0, when frozen backbone exists
+            if _frozen_backbone is not None and replay_buf and len(replay_buf) > 0:
+                rx, ry = replay_buf.sample(_LC_BATCH)
+                if rx is not None:
+                    rx = rx.to(device).float()
+                    # Frozen reference features — no grad
+                    with torch.no_grad():
+                        z_frozen = _extract_features(_frozen_backbone, rx)
+                    # Current features — with grad through free weights
+                    _backbone_live = model.memory.models[0]
+                    _backbone_live.train()
+                    z_current = _extract_features(_backbone_live, rx)
+                    # LCL = α · mean(1 - cosine_similarity(z_current, z_frozen))
+                    # This is the δ-minimisation term from the stability bound
+                    lc_loss = _LC_ALPHA * (
+                        1.0 - F.cosine_similarity(z_current, z_frozen, dim=1)
+                    ).mean()
+                    lc_loss.backward()
+                    # Re-zero sacred gradients after LCL backward
+                    # (LCL backward can re-introduce gradients at sacred positions)
+                    with torch.no_grad():
+                        for pid, p in _pid_to_param.items():
+                            if p.grad is None: continue
+                            mask = model.memory.param_id_to_mask.get(pid)
+                            if mask is not None and mask.any():
+                                p.grad.data[mask] = 0.0
+                    # Step optimizer with LCL gradients
+                    model.optimizer.step()
+                    model.optimizer.zero_grad()
+            return res
+
+        model.train_step = _types.MethodType(_lcl_train_step, model)
+
         # ── Drift diagnostic: snapshot sacred weights before training ──────────
         if t_idx > 0 and sacred_restore_list:
             _pre_train_sacred = {id(p): p.data[mask].clone() for p, mask, _ in sacred_restore_list}
@@ -483,6 +553,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             label_smoothing=0.05 if t_idx == 0 else 0.1,
             scheduler=scheduler,
         )
+
+        # Restore original train_step
+        model.train_step = _orig_train_step
 
         # ── Drift diagnostic: measure how much sacred weights moved ───────────
         if _pre_train_sacred and sacred_restore_list:
@@ -602,6 +675,16 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         num_total    = sum(p.numel() for p in _backbone_ref.parameters() if p.requires_grad)
         model.memory.saturation_level = total_sacred / num_total
         print(f"  [SENTIENT] Locked: {total_sacred:,}/{num_total:,} ({model.memory.saturation_level:.2%})")
+
+        # ── Save frozen backbone after Task 0 for Latent Consistency Loss ──────
+        # This is z₀(x) in the stability bound — the reference feature extractor
+        # whose output we anchor all subsequent tasks against.
+        if t_idx == 0:
+            _frozen_backbone = copy.deepcopy(model.memory.models[0])
+            _frozen_backbone.eval()
+            for _p in _frozen_backbone.parameters():
+                _p.requires_grad = False
+            print("  [LCL] Task-0 feature anchor frozen. δ-minimisation active from Task 1.")
 
         # Evaluate
         task_accs = []
