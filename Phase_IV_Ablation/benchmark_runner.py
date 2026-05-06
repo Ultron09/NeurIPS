@@ -392,6 +392,22 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         _hard_restore_sacred()
     model._apply_sacred_restoration = _framework_sacred_restore
 
+    # Patch gradient centralization to re-zero sacred gradients after mean subtraction.
+    # GC computes grad -= mean(grad) AFTER our hooks have zeroed sacred positions,
+    # which re-introduces non-zero gradients at sacred positions (mean of a row with
+    # some zeros is non-zero, so 0 - mean != 0). We re-zero after GC runs.
+    _orig_gc = model._apply_gradient_centralization
+    def _gc_with_sacred_zero(self_model=None):
+        _orig_gc()
+        # Re-zero gradients at sacred positions after GC
+        with torch.no_grad():
+            for pid, p in _pid_to_param.items():
+                if p.grad is None: continue
+                mask = model.memory.param_id_to_mask.get(pid)
+                if mask is not None and mask.any():
+                    p.grad.data[mask] = 0.0
+    model._apply_gradient_centralization = _gc_with_sacred_zero
+
     # ── Training setup ─────────────────────────────────────────────────────────
     EPOCHS     = epochs_override if epochs_override is not None else 20
     replay_buf = ExternalReplayBuffer(
