@@ -8,7 +8,8 @@ Core principle: 8% sacred weights are ABSOLUTELY IMMUTABLE.
 - CAS hooks disabled (redundant, may interfere)
 - Reptile disabled (overwrites sacred weights)
 - Lookahead disabled (overwrites sacred weights)
-- Small replay (200/task) — enough signal, low interference
+- Replay buffer: 500 samples/task (stronger signal for Class-IL)
+- Fisher importance: 256 samples (4x stronger than baseline)
 - 20 epochs per task
 """
 import os
@@ -233,17 +234,26 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     model.memory.param_id_to_mask   = {}
     model.memory.task_omega_snapshots = {}
 
+    # Per-task quota registry — stored so each task's mask is always evaluated
+    # with the quota it was originally assigned, not the current task's quota.
+    _task_quota_registry = {}
+
     def _v19_update(mem, task_id, backbone_ref):
         """
         Top-K importance mask per task, union across tasks.
         Task 0 gets 30% quota (needs to protect enough backbone for class-IL).
         Tasks 1-9 get 8% each (standard APR quota).
         FC rows and gate rows hard-locked for completed tasks.
+        Each task's quota is stored in _task_quota_registry so the union
+        always re-evaluates each snapshot with its ORIGINAL quota, not the
+        current task's quota (fixes the saturation collapse bug).
         """
         # Task 0 needs a larger quota — it's the only task that trains the full backbone
         # from scratch. 8% is not enough to protect task 0's features in class-IL.
         # 30% ensures the critical feature detectors are locked before task 1 trains.
         PER_TASK_QUOTA = 0.30 if task_id == 0 else 0.08
+        _task_quota_registry[task_id] = PER_TASK_QUOTA
+
         id_to_p = {}; id_to_imp = {}
 
         with torch.no_grad():
@@ -261,12 +271,13 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
         mem.task_omega_snapshots[task_id] = {pid: imp.clone() for pid, imp in id_to_imp.items()}
 
-        # Build cumulative union of top-8% masks
+        # Build cumulative union — each snapshot uses its OWN original quota
         cumulative = {}
-        for snap in mem.task_omega_snapshots.values():
+        for tid_snap, snap in mem.task_omega_snapshots.items():
+            snap_quota = _task_quota_registry.get(tid_snap, 0.08)
             flat = torch.cat([torch.nan_to_num(imp, 0., 0., 0.).view(-1) for imp in snap.values()])
             n = flat.numel()
-            k = max(1, min(int(PER_TASK_QUOTA * n), n))
+            k = max(1, min(int(snap_quota * n), n))
             _, top_idx = torch.topk(flat, k)
             task_flat = torch.zeros_like(flat, dtype=torch.bool)
             task_flat[top_idx] = True
@@ -378,7 +389,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     # ── Training setup ─────────────────────────────────────────────────────────
     EPOCHS     = epochs_override if epochs_override is not None else 20
     replay_buf = ExternalReplayBuffer(
-        per_task=200,
+        per_task=500,
         img_size=64 if dataset_name == "TinyImageNet" else 32
     )
     evaluator  = ContinualEvaluator(model, device=device)
@@ -477,21 +488,21 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # Step 1: SI consolidation only (fast — no backward pass needed)
         model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
 
-        # Step 2: Fast diagonal Fisher on replay buffer (64 samples, one batch)
+        # Step 2: Fast diagonal Fisher on replay buffer (256 samples, one batch)
         if t_idx == 0 or len(replay_buf) > 0:
             _backbone = model.memory.models[0]
             _backbone.eval()
-            # Sample up to 64 items from replay buffer (or current task loader)
+            # Sample up to 256 items from replay buffer (or current task loader)
             if t_idx == 0:
                 # Use a small subset of the current task's training data
                 _fisher_x, _fisher_y = [], []
                 for _bx, _by in train_loader:
                     _fisher_x.append(_bx); _fisher_y.append(_by)
-                    if sum(t.size(0) for t in _fisher_x) >= 64: break
-                _fisher_x = torch.cat(_fisher_x)[:64].to(device).float()
-                _fisher_y = torch.cat(_fisher_y)[:64].to(device)
+                    if sum(t.size(0) for t in _fisher_x) >= 256: break
+                _fisher_x = torch.cat(_fisher_x)[:256].to(device).float()
+                _fisher_y = torch.cat(_fisher_y)[:256].to(device)
             else:
-                _fx, _fy = replay_buf.sample(64)
+                _fx, _fy = replay_buf.sample(256)
                 _fisher_x = _fx.to(device).float() if _fx is not None else None
                 _fisher_y = _fy.to(device) if _fy is not None else None
 
@@ -515,7 +526,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 _backbone.zero_grad()
                 _backbone.train()
                 print(f"  [FISHER] Fast diagonal Fisher computed on {_fisher_x.size(0)} samples.")
-
         # Immutable anchoring (V23 from backup)
         with torch.no_grad():
             for m_tracked in model.memory.models:
@@ -550,12 +560,12 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # IMMUTABLE RULE: once a position is in sacred_restore_list, its anchor
         # value NEVER changes — it stays at the value from when it was first locked.
         # New positions added this task get anchored at their current (just-trained) values.
-        prev_pids = {id(p) for p, _, _ in sacred_restore_list}
+        # Capture old anchors BEFORE _rebuild_restore_list() clears the list.
+        old_anchors = {id(p): anc.clone() for p, _, anc in sacred_restore_list}
+        prev_pids   = set(old_anchors.keys())
         _rebuild_restore_list()
         # For positions that were already sacred, restore their OLD anchor values
         # (don't overwrite with current values — that would legalize drift)
-        old_anchors = {id(p): anc.clone() for p, _, anc in sacred_restore_list
-                       if id(p) in prev_pids}
         for i, (p, mask, anchor) in enumerate(sacred_restore_list):
             pid = id(p)
             if pid in old_anchors:
