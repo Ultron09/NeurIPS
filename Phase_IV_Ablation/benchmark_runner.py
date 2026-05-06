@@ -61,20 +61,22 @@ if hasattr(moe_mod, 'SparseMoE'):
             )
 
         # Block routing to frozen experts during training (expert dedication)
-        # Frozen experts are dedicated to previous tasks — new tasks must use free experts
+        # Frozen experts are dedicated to previous tasks — new tasks must use free experts.
+        # We must clone weights before modifying to avoid in-place autograd graph corruption.
         if self.training:
             frozen_mask = torch.zeros(self.num_experts, dtype=torch.bool, device=x.device)
             for i, expert in enumerate(self.experts):
                 if all(not p.requires_grad for p in expert.parameters()):
                     frozen_mask[i] = True
             if frozen_mask.any() and not frozen_mask.all():
-                # Zero weights for frozen experts, re-normalize
-                for k_pos in range(weights.shape[1]):
-                    ei = indices[:, k_pos]
-                    is_frozen = frozen_mask[ei]
-                    weights[is_frozen, k_pos] = 0.0
-                weight_sum = weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
-                weights = weights / weight_sum
+                # Build a per-sample, per-k mask of frozen selections
+                # indices shape: (B, top_k)
+                is_frozen_selection = frozen_mask[indices]  # (B, top_k) bool
+                # Zero out weights for frozen expert selections, re-normalize
+                # Use out-of-place ops to preserve autograd graph
+                free_weights = weights * (~is_frozen_selection).float()
+                weight_sum = free_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                weights = free_weights / weight_sum
 
         for k_pos in range(self.top_k):
             ei = indices[:, k_pos]; w = weights[:, k_pos]
