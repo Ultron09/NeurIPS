@@ -470,6 +470,12 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             optimizer, T_max=EPOCHS * len(train_loader), eta_min=1e-5
         )
 
+        # ── Drift diagnostic: snapshot sacred weights before training ──────────
+        if t_idx > 0 and sacred_restore_list:
+            _pre_train_sacred = {id(p): p.data[mask].clone() for p, mask, _ in sacred_restore_list}
+        else:
+            _pre_train_sacred = {}
+
         train_single_task(
             model, train_loader, train_loader, optimizer, t_idx,
             device=device, epochs=EPOCHS,
@@ -477,6 +483,18 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             label_smoothing=0.05 if t_idx == 0 else 0.1,
             scheduler=scheduler,
         )
+
+        # ── Drift diagnostic: measure how much sacred weights moved ───────────
+        if _pre_train_sacred and sacred_restore_list:
+            total_drift = 0.0; total_els = 0
+            for p, mask, _ in sacred_restore_list:
+                pid = id(p)
+                if pid in _pre_train_sacred:
+                    drift = (p.data[mask] - _pre_train_sacred[pid]).abs().mean().item()
+                    total_drift += drift; total_els += 1
+            avg_drift = total_drift / total_els if total_els > 0 else 0.0
+            print(f"  [DRIFT] Task {t_idx}: avg sacred weight drift = {avg_drift:.6f} "
+                  f"({'DRIFTING!' if avg_drift > 1e-6 else 'HELD'})")
 
         # Update replay buffer
         replay_buf.update_from_loader(
@@ -566,17 +584,19 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # IMMUTABLE RULE: once a position is in sacred_restore_list, its anchor
         # value NEVER changes — it stays at the value from when it was first locked.
         # New positions added this task get anchored at their current (just-trained) values.
-        # Capture old anchors BEFORE _rebuild_restore_list() clears the list.
-        old_anchors = {id(p): anc.clone() for p, _, anc in sacred_restore_list}
-        prev_pids   = set(old_anchors.keys())
+        # Capture old anchors and masks BEFORE _rebuild_restore_list() clears the list.
+        old_anchor_map = {id(p): (mask.clone(), anc.clone()) for p, mask, anc in sacred_restore_list}
         _rebuild_restore_list()
-        # For positions that were already sacred, restore their OLD anchor values
-        # (don't overwrite with current values — that would legalize drift)
-        for i, (p, mask, anchor) in enumerate(sacred_restore_list):
+        # For positions that were already sacred, restore their OLD anchor values.
+        # For newly-sacred positions, keep the NEW anchor values (current trained values).
+        for i, (p, new_mask, new_anchor) in enumerate(sacred_restore_list):
             pid = id(p)
-            if pid in old_anchors:
-                # This param was already sacred — keep the original anchor
-                sacred_restore_list[i] = (p, mask, old_anchors[pid])
+            if pid in old_anchor_map:
+                old_mask, old_anchor = old_anchor_map[pid]
+                # Merge: old positions keep old anchors, new positions keep new anchors
+                merged_anchor = new_anchor.clone()
+                merged_anchor[old_mask] = old_anchor[old_mask]
+                sacred_restore_list[i] = (p, new_mask, merged_anchor)
 
         total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
         num_total    = sum(p.numel() for p in _backbone_ref.parameters() if p.requires_grad)
