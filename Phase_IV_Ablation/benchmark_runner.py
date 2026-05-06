@@ -53,44 +53,6 @@ class ContinualResNet(ResNet):
     def forward(self, x, task_id=None, **kwargs):
         return super().forward(x)
 
-# ── Weighted MoE dispatcher — no task_id oracle ────────────────────────────────
-if hasattr(moe_mod, 'SparseMoE'):
-    def _class_il_sparse_fwd(self, x, task_id=None, consciousness_state=None, *args, **kwargs):
-        gate_out = self.gate(x, task_id=None, consciousness_state=consciousness_state)
-        if isinstance(gate_out, tuple):
-            weights, indices = gate_out
-        else:
-            top_k_logits, indices = torch.topk(gate_out, self.top_k, dim=1)
-            weights = torch.softmax(top_k_logits, dim=1)
-        if not hasattr(self, '_out_dim'):
-            with torch.no_grad():
-                _was_training = self.experts[0].training
-                self.experts[0].eval()
-                t = self.experts[0](x[:2], task_id=None)
-                if _was_training:
-                    self.experts[0].train()
-                self._out_dim = (t[0] if isinstance(t, tuple) else t).shape[1]
-        out = torch.zeros(x.size(0), self._out_dim, device=x.device, dtype=x.dtype)
-
-        # Track expert usage
-        with torch.no_grad():
-            flat_indices = indices.view(-1)
-            self.expert_usage.index_add_(
-                0, flat_indices,
-                torch.ones_like(flat_indices, dtype=self.expert_usage.dtype)
-            )
-
-        for k_pos in range(self.top_k):
-            ei = indices[:, k_pos]; w = weights[:, k_pos]
-            for i in range(self.num_experts):
-                sel = (ei == i)
-                if not sel.any(): continue
-                e_out = self.experts[i](x[sel], task_id=None)
-                if isinstance(e_out, tuple): e_out = e_out[0]
-                if e_out.shape[1] == self._out_dim:
-                    out[sel] += e_out * w[sel].view(-1, 1)
-        return out, indices
-    moe_mod.SparseMoE.forward = _class_il_sparse_fwd
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
 root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
