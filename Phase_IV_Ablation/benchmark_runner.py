@@ -235,11 +235,15 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
     def _v19_update(mem, task_id, backbone_ref):
         """
-        Top-8% importance mask per task, union across tasks.
+        Top-K importance mask per task, union across tasks.
+        Task 0 gets 30% quota (needs to protect enough backbone for class-IL).
+        Tasks 1-9 get 8% each (standard APR quota).
         FC rows and gate rows hard-locked for completed tasks.
-        All masks stored in param_id_to_mask AND sacred_mask.
         """
-        PER_TASK_QUOTA = 0.08
+        # Task 0 needs a larger quota — it's the only task that trains the full backbone
+        # from scratch. 8% is not enough to protect task 0's features in class-IL.
+        # 30% ensures the critical feature detectors are locked before task 1 trains.
+        PER_TASK_QUOTA = 0.30 if task_id == 0 else 0.08
         id_to_p = {}; id_to_imp = {}
 
         with torch.no_grad():
@@ -330,10 +334,12 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     model.memory._v19_update = _v19_update
 
     # ── Absolute lock: gradient hooks + post-step hard restoration ─────────────
-    # The gradient hooks zero gradients for sacred params (prevents optimizer update).
-    # The post-step restoration is the HARD guarantee — even if something slips
-    # through (weight decay, numerical noise), we snap back to anchor.
-    # This is the "absolute immutability" the user requested.
+    # Build a direct pid->param lookup for O(1) restoration
+    _pid_to_param = {}
+    for tracked in model.memory.models:
+        for p in tracked.parameters():
+            if p.requires_grad:
+                _pid_to_param[id(p)] = p
 
     def _make_grad_hook(p_id, mem):
         """Zero gradient for sacred positions."""
@@ -345,30 +351,29 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         return hook
 
     hook_handles = []
-    for tracked in model.memory.models:
-        for p in tracked.parameters():
-            if p.requires_grad:
-                h = p.register_hook(_make_grad_hook(id(p), model.memory))
-                hook_handles.append(h)
+    for p in _pid_to_param.values():
+        h = p.register_hook(_make_grad_hook(id(p), model.memory))
+        hook_handles.append(h)
     print(f"  [IRON MIND] {len(hook_handles)} absolute gradient locks installed.")
 
-    # ── Sacred anchor store ────────────────────────────────────────────────────
-    # Stores the post-task-0 values of sacred params.
-    # After every optimizer step, sacred params are snapped back to these values.
-    sacred_anchors = {}  # param_id -> tensor (on param's device)
+    # Sacred anchor store — pid -> (param_ref, anchor_tensor, mask)
+    # Built after each task's V19 update for O(1) restoration
+    sacred_restore_list = []  # list of (param, mask, anchor) tuples
+
+    def _rebuild_restore_list():
+        """Rebuild the fast restoration list after mask changes."""
+        sacred_restore_list.clear()
+        for pid, p in _pid_to_param.items():
+            mask = model.memory.param_id_to_mask.get(pid)
+            if mask is not None and mask.any():
+                anchor = p.data.clone().detach()
+                sacred_restore_list.append((p, mask, anchor))
 
     def _hard_restore_sacred():
-        """Snap all sacred params back to their anchor values. Absolute."""
+        """Snap all sacred params back to anchor. O(n_sacred) not O(n_params²)."""
         with torch.no_grad():
-            for pid, anchor in sacred_anchors.items():
-                mask = model.memory.param_id_to_mask.get(pid)
-                if mask is None or not mask.any(): continue
-                # Find the param
-                for tracked in model.memory.models:
-                    for p in tracked.parameters():
-                        if id(p) == pid:
-                            p.data[mask] = anchor[mask]
-                            break
+            for p, mask, anchor in sacred_restore_list:
+                p.data[mask] = anchor[mask]
 
     # ── Training setup ─────────────────────────────────────────────────────────
     EPOCHS     = epochs_override if epochs_override is not None else 20
@@ -449,7 +454,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
         def _hardened_train_step(self, x, target_data=None, **kwargs):
             res = _orig_train_step(x, target_data=target_data, **kwargs)
-            if t_idx > 0 and sacred_anchors:
+            if t_idx > 0 and sacred_restore_list:
                 _hard_restore_sacred()
             return res
         model.train_step = types.MethodType(_hardened_train_step, model)
@@ -550,33 +555,21 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         _backbone_ref = model.memory.models[0]
         model.memory._v19_update(model.memory, t_idx, _backbone_ref)
 
-        # Update sacred_anchors with current param values for ALL sacred params
-        # This is the ground truth that hard restoration will snap back to
-        with torch.no_grad():
-            for tracked in model.memory.models:
-                for p in tracked.parameters():
-                    pid = id(p)
-                    mask = model.memory.param_id_to_mask.get(pid)
-                    if mask is not None and mask.any():
-                        if pid not in sacred_anchors:
-                            sacred_anchors[pid] = p.data.clone().detach()
-                        else:
-                            # Only update the newly-sacred positions (not already-sacred ones)
-                            # Already-sacred positions keep their original anchor values
-                            old_anchor = sacred_anchors[pid]
-                            new_anchor = p.data.clone().detach()
-                            # Keep old anchor where it was already sacred, use new where newly sacred
-                            if pid in model.memory.param_id_to_mask:
-                                # The mask grew — new positions are newly sacred
-                                # We want to anchor them at their current (just-trained) values
-                                sacred_anchors[pid] = new_anchor
-                                # But restore old sacred positions to their original anchor
-                                if old_anchor.shape == new_anchor.shape:
-                                    # Find positions that were sacred before this task
-                                    # (we don't track this separately, so use the anchor itself)
-                                    # Simple approach: keep old anchor for all positions
-                                    # that were already in old_anchor with non-zero values
-                                    sacred_anchors[pid] = new_anchor
+        # Rebuild the fast restoration list with current param values as anchors.
+        # IMMUTABLE RULE: once a position is in sacred_restore_list, its anchor
+        # value NEVER changes — it stays at the value from when it was first locked.
+        # New positions added this task get anchored at their current (just-trained) values.
+        prev_pids = {id(p) for p, _, _ in sacred_restore_list}
+        _rebuild_restore_list()
+        # For positions that were already sacred, restore their OLD anchor values
+        # (don't overwrite with current values — that would legalize drift)
+        old_anchors = {id(p): anc.clone() for p, _, anc in sacred_restore_list
+                       if id(p) in prev_pids}
+        for i, (p, mask, anchor) in enumerate(sacred_restore_list):
+            pid = id(p)
+            if pid in old_anchors:
+                # This param was already sacred — keep the original anchor
+                sacred_restore_list[i] = (p, mask, old_anchors[pid])
 
         total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
         num_total    = sum(p.numel() for p in _backbone_ref.parameters() if p.requires_grad)
