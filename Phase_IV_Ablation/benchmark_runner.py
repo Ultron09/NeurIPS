@@ -283,7 +283,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     s, e = tid * cpt, min((tid + 1) * cpt, fc.bias.shape[0])
                     cumulative[fc_b_id][s:e] = True
 
-        # Hard-lock MoE gate routing rows for completed tasks
+        # Hard-lock ALL gate weights after Task 0 — the gate learned to route
+        # Task 0 inputs correctly. Any change misroutes Task 0 inputs even if
+        # FC weights are frozen. Lock the entire gate, not just one row per task.
         for m_tracked in mem.models:
             for name, module in m_tracked.named_modules():
                 if "gate" in name.lower() and hasattr(module, 'weight'):
@@ -291,10 +293,14 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     if g_id not in cumulative:
                         cumulative[g_id] = torch.zeros(module.weight.shape, dtype=torch.bool,
                                                         device=module.weight.device)
-                    for tid in mem.task_omega_snapshots:
-                        num_exp = module.weight.shape[0]
-                        target_exp = tid % num_exp
-                        cumulative[g_id][target_exp, :] = True
+                    # Lock ALL gate rows (entire gate frozen after first task)
+                    cumulative[g_id][:, :] = True
+                    if hasattr(module, 'bias') and module.bias is not None:
+                        gb_id = id(module.bias)
+                        if gb_id not in cumulative:
+                            cumulative[gb_id] = torch.zeros(module.bias.shape, dtype=torch.bool,
+                                                             device=module.bias.device)
+                        cumulative[gb_id][:] = True
 
         # Commit masks
         mem.param_id_to_mask = {}
