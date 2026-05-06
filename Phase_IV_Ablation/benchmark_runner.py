@@ -446,13 +446,18 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # Disable gradient noise injection for this task
         model._steps_since_task_start = 100
 
-        # Snapshot FC rows 0-9 before training to detect any drift
+        # Snapshot FC rows 0-9 AND BN running stats before training to detect any drift
         if t_idx > 0:
             _fc_pre = {}
             for exp_name, exp_bb in _all_expert_backbones:
                 fc = getattr(exp_bb, 'fc', None)
                 if fc is not None:
                     _fc_pre[exp_name] = fc.weight.data[:cpt].clone()
+            # Snapshot BN running stats from first expert
+            first_bb = _all_expert_backbones[0][1]
+            for name, module in first_bb.named_modules():
+                if isinstance(module, nn.BatchNorm2d) and hasattr(module, 'running_mean'):
+                    _fc_pre[f"bn_{name}"] = module.running_mean.clone()
 
         train_single_task(
             model, train_loader, train_loader, None, t_idx,
@@ -469,6 +474,16 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     max_drift = max(max_drift, drift)
             print(f"  [FC DRIFT] Task {t_idx}: max FC rows 0-{cpt-1} drift = {max_drift:.8f} "
                   f"({'DRIFTING!' if max_drift > 1e-6 else 'HELD'})")
+
+            # Also check BN running stats drift in first expert
+            first_bb = _all_expert_backbones[0][1]
+            bn_drift = 0.0
+            for name, module in first_bb.named_modules():
+                if isinstance(module, nn.BatchNorm2d) and hasattr(module, 'running_mean'):
+                    if f"bn_{name}" in _fc_pre:
+                        d = (module.running_mean - _fc_pre[f"bn_{name}"]).abs().max().item()
+                        bn_drift = max(bn_drift, d)
+            print(f"  [BN DRIFT] Task {t_idx}: max BN running_mean drift = {bn_drift:.6f}")
 
         # ── Consolidation + Immutable Anchoring (V23) ──────────────────────────
         print(f"  [ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
