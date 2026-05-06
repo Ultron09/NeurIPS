@@ -456,19 +456,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # Disable gradient noise injection for this task
         model._steps_since_task_start = 100
 
-        # For tasks after Task 0: freeze ALL BatchNorm layers in eval mode.
-        # BN running stats drifted by 1.3 (confirmed by diagnostic) — this is
-        # the root cause of 0.0000 Task 0 accuracy.
-        # We patch train() on EVERY sub-module to keep BN frozen.
-        if t_idx > 0:
-            # Collect all BN modules across the entire model hierarchy
-            _bn_modules = [m for m in model.modules()
-                           if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))]
-            # Force eval and disable tracking permanently for this task
-            for bn in _bn_modules:
-                bn.eval()
-                bn.track_running_stats = False  # stop updating running stats entirely
-            print(f"  [BN] {len(_bn_modules)} BatchNorm layers frozen (track_running_stats=False).")
+        # [V31.8] ETERNAL MIND: Global BN Freeze Removed
+        # Hard Expert Isolation mathematically prevents BN drift on old experts,
+        # so we can safely allow the new expert to train its BN layers naturally.
 
         # Snapshot FC rows 0-9 AND BN running stats before training to detect any drift
         if t_idx > 0:
@@ -488,11 +478,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             device=device, epochs=EPOCHS,
         )
 
-        # Restore BN tracking after training (needed for correct eval)
-        if t_idx > 0:
-            for bn in _bn_modules:
-                bn.track_running_stats = True
-                bn.train()  # restore to train mode for next task's BN freeze
 
         # Check FC drift after training
         if t_idx > 0 and _fc_pre:
