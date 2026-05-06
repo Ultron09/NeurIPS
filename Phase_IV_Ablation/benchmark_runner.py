@@ -51,6 +51,31 @@ if hasattr(moe_mod, 'SparseMoE'):
                 t = self.experts[0](x[:1], task_id=None)
                 self._out_dim = (t[0] if isinstance(t, tuple) else t).shape[1]
         out = torch.zeros(x.size(0), self._out_dim, device=x.device, dtype=x.dtype)
+
+        # Track expert usage (needed for expert dedication / freezing)
+        with torch.no_grad():
+            flat_indices = indices.view(-1)
+            self.expert_usage.index_add_(
+                0, flat_indices,
+                torch.ones_like(flat_indices, dtype=self.expert_usage.dtype)
+            )
+
+        # Block routing to frozen experts during training (expert dedication)
+        # Frozen experts are dedicated to previous tasks — new tasks must use free experts
+        if self.training:
+            frozen_mask = torch.zeros(self.num_experts, dtype=torch.bool, device=x.device)
+            for i, expert in enumerate(self.experts):
+                if all(not p.requires_grad for p in expert.parameters()):
+                    frozen_mask[i] = True
+            if frozen_mask.any() and not frozen_mask.all():
+                # Zero weights for frozen experts, re-normalize
+                for k_pos in range(weights.shape[1]):
+                    ei = indices[:, k_pos]
+                    is_frozen = frozen_mask[ei]
+                    weights[is_frozen, k_pos] = 0.0
+                weight_sum = weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                weights = weights / weight_sum
+
         for k_pos in range(self.top_k):
             ei = indices[:, k_pos]; w = weights[:, k_pos]
             for i in range(self.num_experts):
