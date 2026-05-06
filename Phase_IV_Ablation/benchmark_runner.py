@@ -489,8 +489,20 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # V19 mask rebuild
         model.memory._v19_update(model.memory, t_idx, _backbone_ref)
 
+        # Diagnostic: verify FC rows are actually locked
+        fc_locked = 0
+        for _, exp_bb in _all_expert_backbones:
+            fc = getattr(exp_bb, 'fc', None)
+            if fc is not None:
+                pid = id(fc.weight)
+                mask = model.memory.param_id_to_mask.get(pid)
+                if mask is not None:
+                    fc_locked += mask[:e, :].sum().item()
+        print(f"  [FC CHECK] FC rows 0-{e-1} locked positions: {int(fc_locked):,} across {len(_all_expert_backbones)} experts")
+
         total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
-        num_total    = sum(p.numel() for p in _backbone_ref.parameters() if p.requires_grad)
+        num_total    = sum(p.numel() for m in model.memory.models
+                          for p in m.parameters() if p.requires_grad)
         model.memory.saturation_level = total_sacred / num_total
         print(f"  [SENTIENT] Locked: {total_sacred:,}/{num_total:,} ({model.memory.saturation_level:.2%})")
 
