@@ -359,9 +359,19 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     if not p.requires_grad: continue
                     pid = id(p)
                     id_to_p[pid] = (name, p)
-                    curr = mem.omega.get(name, torch.zeros_like(p)).clone()
+                    curr = mem.omega.get(name, None)
+                    if curr is None:
+                        curr = mem.omega.get(f"m0_{name}", torch.zeros_like(p)).clone()
+                    else:
+                        curr = curr.clone()
+                        # Also add m0_ prefixed SI omega if present
+                        si_key = f"m0_{name}"
+                        if si_key in mem.omega:
+                            curr = curr + mem.omega[si_key].to(curr.device)
                     if name in mem.fisher_dict:
                         curr = curr + mem.fisher_dict[name].to(curr.device)
+                    if f"m0_{name}" in mem.fisher_dict:
+                        curr = curr + mem.fisher_dict[f"m0_{name}"].to(curr.device)
                     id_to_imp[pid] = curr.abs() + torch.randn_like(curr) * 1e-12
 
         if not id_to_imp: return
@@ -767,11 +777,12 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 with torch.no_grad():
                     for name, p in _backbone.named_parameters():
                         if p.requires_grad and p.grad is not None:
-                            # Fisher diagonal = grad²
                             fisher_diag = p.grad.data.pow(2)
-                            # Add to omega (SI already accumulated there)
-                            existing = model.memory.omega.get(name, torch.zeros_like(p))
-                            model.memory.omega[name] = existing + fisher_diag * 400.0
+                            # Store with BOTH bare name (for V19 lookup) AND
+                            # m0_ prefix (for SI omega compatibility)
+                            for key in [name, f"m0_{name}"]:
+                                existing = model.memory.omega.get(key, torch.zeros_like(p))
+                                model.memory.omega[key] = existing + fisher_diag * 400.0
                 _backbone.zero_grad()
                 _backbone.train()
                 print(f"  [FISHER] Fast diagonal Fisher computed on {_fisher_x.size(0)} samples.")
