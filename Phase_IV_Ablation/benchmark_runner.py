@@ -145,6 +145,22 @@ def _extract_features(backbone, x):
     x = backbone.avgpool(x)
     return torch.flatten(x, 1)   # (B, 512)
 
+def _extract_early_features(backbone, x):
+    """
+    Extract early-layer features only (after layer2).
+    Early layers (conv1, layer1, layer2) are universal feature detectors
+    that should be preserved across tasks. Later layers (layer3, layer4)
+    need plasticity to adapt to new task distributions.
+    Anchoring only early layers balances stability vs plasticity.
+    """
+    x = backbone.conv1(x)
+    x = backbone.bn1(x)
+    x = backbone.relu(x)
+    x = backbone.maxpool(x)
+    x = backbone.layer1(x)
+    x = backbone.layer2(x)
+    return x.mean(dim=[2, 3])  # Global average pool → (B, 128)
+
 # ── Replay buffer (small — 200/task) ──────────────────────────────────────────
 class ExternalReplayBuffer:
     def __init__(self, per_task=200, img_size=32):
@@ -484,9 +500,11 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     # from the stability bound. α controls the consistency coefficient.
     # _frozen_experts: list of frozen ContinualResNet copies, one per MoE expert.
     # Updated after each task to anchor ALL seen tasks' feature spaces.
+    # We anchor only early layers (conv1→layer2) to preserve universal feature
+    # detectors while allowing later layers to adapt for new tasks.
     _frozen_experts = []   # list of frozen ContinualResNet per expert
-    _LC_ALPHA        = 5.0    # α in the stability bound — stronger signal needed
-    _LC_BATCH        = 128    # replay samples per LCL backward pass
+    _LC_ALPHA        = 1.0    # α — conservative to preserve plasticity
+    _LC_BATCH        = 64     # replay samples per LCL backward pass
     replay_buf = ExternalReplayBuffer(
         per_task=500,
         img_size=64 if dataset_name == "TinyImageNet" else 32
@@ -571,13 +589,14 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     total_lc = torch.tensor(0.0, device=device)
                     for exp_idx, (frozen_exp, live_exp) in enumerate(
                             zip(_frozen_experts, live_experts)):
-                        # Frozen reference features — no grad
+                        # Frozen early-layer features — no grad
                         with torch.no_grad():
-                            z_frozen = _extract_features(frozen_exp, rx)
-                        # Current features — with grad through free weights
+                            z_frozen = _extract_early_features(frozen_exp, rx)
+                        # Current early-layer features — with grad
                         live_exp.train()
-                        z_current = _extract_features(live_exp, rx)
-                        # LCL = α · mean(1 - cosine_similarity(z_current, z_frozen))
+                        z_current = _extract_early_features(live_exp, rx)
+                        # LCL on early layers only — preserves universal detectors
+                        # while allowing later layers to adapt for new tasks
                         total_lc = total_lc + (
                             1.0 - F.cosine_similarity(z_current, z_frozen, dim=1)
                         ).mean()
