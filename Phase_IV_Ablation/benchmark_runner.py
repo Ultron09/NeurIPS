@@ -210,10 +210,14 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     def _v19_update(mem, task_id, backbone_ref):
         """
         Top-K importance mask per task, union across tasks.
-        Flat 8% quota for all tasks (matches backup).
-        FC rows and gate rows hard-locked for completed tasks.
+        Task 0 gets 50% quota to protect the backbone feature extractor.
+        Subsequent tasks get 8% each.
+        FC rows, gate rows, and early backbone layers hard-locked.
         """
-        PER_TASK_QUOTA = 0.08
+        # Task 0 needs a much larger quota — it trains the backbone from scratch.
+        # The backbone features must be preserved for all future tasks.
+        # 50% ensures the critical feature detectors are locked before Task 1.
+        PER_TASK_QUOTA = 0.50 if task_id == 0 else 0.08
         _task_quota_registry[task_id] = PER_TASK_QUOTA
 
         id_to_p = {}; id_to_imp = {}
@@ -301,6 +305,20 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                             cumulative[gb_id] = torch.zeros(module.bias.shape, dtype=torch.bool,
                                                              device=module.bias.device)
                         cumulative[gb_id][:] = True
+
+        # Hard-lock early backbone layers (conv1, layer1, layer2) after Task 0.
+        # These are universal feature detectors — if they change, Task 0's
+        # frozen FC rows receive wrong features and produce wrong predictions.
+        if task_id >= 0:  # Lock from Task 0 onwards
+            for exp_name, exp_backbone in _all_expert_backbones:
+                for layer_name in ['conv1', 'bn1', 'layer1', 'layer2']:
+                    layer = getattr(exp_backbone, layer_name, None)
+                    if layer is None: continue
+                    for p in layer.parameters():
+                        pid = id(p)
+                        if pid not in cumulative:
+                            cumulative[pid] = torch.zeros(p.shape, dtype=torch.bool, device=p.device)
+                        cumulative[pid][:] = True
 
         # Commit masks
         mem.param_id_to_mask = {}
@@ -545,14 +563,26 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 hasattr(model.meta_controller, 'reptile') and
                 model.meta_controller.reptile is not None):
             rep = model.meta_controller.reptile
-            # Re-anchor to current post-consolidation weights
-            # so Reptile doesn't pull sacred weights back to pre-task values
-            rep.anchor_weights = {
-                k: v.clone().detach()
-                for k, v in model.model.state_dict().items()
-            }
-            print(f"  [REPTILE] Anchor weights re-synced after Task {t_idx}.")
-
+            if rep.anchor_weights is not None:
+                # Selective re-sync: update anchor only for NON-sacred weights.
+                # Sacred weights keep their anchor from when they were first locked
+                # (Reptile should not pull them back to pre-lock values).
+                # Non-sacred weights get updated anchor so Reptile acts as a
+                # task-transition regularizer, not a full reset.
+                with torch.no_grad():
+                    for name, param in model.model.named_parameters():
+                        if name in rep.anchor_weights:
+                            mask = model.memory.sacred_mask.get(name, None)
+                            if mask is None:
+                                # Fully free weight — update anchor to current value
+                                rep.anchor_weights[name] = param.data.clone().detach()
+                            else:
+                                # Partially sacred — update only free positions
+                                old_anchor = rep.anchor_weights[name]
+                                new_anchor = old_anchor.clone()
+                                new_anchor[~mask] = param.data[~mask]
+                                rep.anchor_weights[name] = new_anchor
+                print(f"  [REPTILE] Anchor selectively re-synced after Task {t_idx} (sacred positions held).")
         # Evaluate
         task_accs = []
         for i, l in enumerate(test_loaders):
