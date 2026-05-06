@@ -260,20 +260,25 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
                 pos += pn
 
-        # Hard-lock FC rows for all completed tasks
-        fc = getattr(backbone_ref, 'fc', None)
-        if fc is not None:
+        # Hard-lock FC rows for all completed tasks — ALL expert FC heads
+        # H-MoE has 8 independent FC heads (domains.X.experts.Y.model.fc)
+        # All must be locked or Task N will overwrite Task 0's classification rows
+        for exp_name, exp_backbone in _all_expert_backbones:
+            fc = getattr(exp_backbone, 'fc', None)
+            if fc is None: continue
             cpt = config.classes_per_task
             fc_w_id = id(fc.weight)
             if fc_w_id not in cumulative:
-                cumulative[fc_w_id] = torch.zeros(fc.weight.shape, dtype=torch.bool, device=fc.weight.device)
+                cumulative[fc_w_id] = torch.zeros(fc.weight.shape, dtype=torch.bool,
+                                                   device=fc.weight.device)
             for tid in mem.task_omega_snapshots:
                 s, e = tid * cpt, min((tid + 1) * cpt, fc.weight.shape[0])
                 cumulative[fc_w_id][s:e, :] = True
             if fc.bias is not None:
                 fc_b_id = id(fc.bias)
                 if fc_b_id not in cumulative:
-                    cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool, device=fc.bias.device)
+                    cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool,
+                                                       device=fc.bias.device)
                 for tid in mem.task_omega_snapshots:
                     s, e = tid * cpt, min((tid + 1) * cpt, fc.bias.shape[0])
                     cumulative[fc_b_id][s:e] = True
@@ -378,14 +383,27 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     metrics    = MetricsEngine(num_tasks=num_tasks,
                                config_name=f"ANTARA_S{stage_id}_{dataset_name}_seed{seed}")
     test_loaders = []
-    _backbone_ref = model.memory.models[0]
+
+    # Find all expert backbones (ContinualResNet instances) in the H-MoE hierarchy
+    def _get_all_expert_backbones(moe_model):
+        """Return all ContinualResNet backbones from all domains and experts."""
+        backbones = []
+        for name, module in moe_model.named_modules():
+            if isinstance(module, ContinualResNet):
+                backbones.append((name, module))
+        return backbones
+
+    _all_expert_backbones = _get_all_expert_backbones(model.memory.models[0])
+    # Use first expert backbone as the reference for V19 (FC hard-lock iterates all)
+    _backbone_ref = _all_expert_backbones[0][1] if _all_expert_backbones else model.memory.models[0]
+    print(f"  [SYSTEM] Found {len(_all_expert_backbones)} expert backbones for Iron Mind.")
 
     for t_idx in range(num_tasks):
         train_loader, _, test_loader = curriculum.get_task(t_idx)
         test_loaders.append(test_loader)
         train_loader.num_workers = 0; train_loader.pin_memory = True
 
-        # Unlock current task's FC rows before training
+        # Unlock current task's FC rows before training — ALL expert FC heads
         cpt = config.classes_per_task
         s, e = t_idx * cpt, (t_idx + 1) * cpt
         for k, mask in model.memory.sacred_mask.items():
@@ -395,8 +413,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     else: mask[s:e, :].zero_()
         for pid, mask in model.memory.param_id_to_mask.items():
             if mask.dim() >= 1 and mask.shape[0] >= e:
-                for tracked in model.memory.models:
-                    for name, p in tracked.named_parameters():
+                for _, exp_bb in _all_expert_backbones:
+                    for name, p in exp_bb.named_parameters():
                         if id(p) == pid and 'fc' in name:
                             with torch.no_grad():
                                 if mask.dim() == 1: mask[s:e].zero_()
@@ -417,8 +435,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         print(f"  [ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
         model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
 
-        # Fast diagonal Fisher — stored with BOTH key formats
-        _backbone = model.memory.models[0]
+        # Fast diagonal Fisher — use first expert backbone, stored with BOTH key formats
+        _backbone = _all_expert_backbones[0][1] if _all_expert_backbones else model.memory.models[0]
         _backbone.eval()
         _fisher_x, _fisher_y = [], []
         for _bx, _by in train_loader:
@@ -477,7 +495,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         print(f"  [SENTIENT] Locked: {total_sacred:,}/{num_total:,} ({model.memory.saturation_level:.2%})")
 
         # V17 Reset Lookahead slow_weights after consolidation
-        # Prevents stale slow weights from overwriting sacred coordinates
         if hasattr(model, 'slow_weights') and config.use_lookahead:
             model.slow_weights = {
                 n: p.data.clone().detach()
