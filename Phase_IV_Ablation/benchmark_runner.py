@@ -73,7 +73,15 @@ if hasattr(moe_mod, 'SparseMoE'):
             for i in range(self.num_experts):
                 sel = (ei == i)
                 if not sel.any(): continue
+                # BN requires batch_size > 1 during training.
+                # For single-sample batches, temporarily use eval mode
+                # so BN uses running stats instead of batch stats.
+                single_sample = self.training and sel.sum() < 2
+                if single_sample:
+                    self.experts[i].eval()
                 e_out = self.experts[i](x[sel], task_id=None)
+                if single_sample:
+                    self.experts[i].train()
                 if isinstance(e_out, tuple): e_out = e_out[0]
                 if e_out.shape[1] == self._out_dim:
                     out[sel] += e_out * w[sel].view(-1, 1)
