@@ -537,7 +537,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     # applied at the expert level — no soft regularization needed.
     # With 10 experts and 10 tasks, each task gets ~1 dedicated expert.
     _task_expert_map = {}   # task_id -> list of frozen expert indices
-    _EXPERTS_PER_TASK = 1   # freeze 1 expert per task (10 tasks, 10 experts)
+    _EXPERTS_PER_TASK = 2   # freeze 2 experts per task — matches top_k=2
+    # With 10 experts and top_k=2: tasks 0-4 get 2 dedicated experts each (5 tasks)
+    # Tasks 5-9 share the remaining experts with replay-based protection
     _moe = model.model if hasattr(model.model, 'experts') else None
     print(f"  [MoE] model.model type: {type(model.model).__name__}, _moe set: {_moe is not None}")
 
@@ -865,14 +867,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
         # ── Expert dedication: freeze top-used experts after each task ──────────
         if _moe is not None:
-            # Get top experts by usage
-            if hasattr(_moe, 'get_top_experts'):
-                top_experts = _moe.get_top_experts(_EXPERTS_PER_TASK)
-            else:
-                # Fallback: manual topk
-                _, top_idx = torch.topk(_moe.expert_usage, _EXPERTS_PER_TASK)
-                top_experts = top_idx.tolist()
-
             # Get already frozen experts
             if hasattr(_moe, 'get_frozen_experts'):
                 already_frozen = _moe.get_frozen_experts()
@@ -880,7 +874,21 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 already_frozen = [i for i, exp in enumerate(_moe.experts)
                                   if all(not p.requires_grad for p in exp.parameters())]
 
-            new_to_freeze = [e for e in top_experts if e not in already_frozen]
+            # Only freeze if we have enough free experts left for future tasks
+            # Keep at least 1 free expert available
+            free_count = len(_moe.experts) - len(already_frozen)
+            experts_to_freeze = min(_EXPERTS_PER_TASK, max(0, free_count - 1))
+
+            if experts_to_freeze > 0:
+                if hasattr(_moe, 'get_top_experts'):
+                    top_experts = _moe.get_top_experts(experts_to_freeze + len(already_frozen))
+                else:
+                    _, top_idx = torch.topk(_moe.expert_usage, experts_to_freeze + len(already_frozen))
+                    top_experts = top_idx.tolist()
+
+                new_to_freeze = [e for e in top_experts if e not in already_frozen][:experts_to_freeze]
+            else:
+                new_to_freeze = []
             if new_to_freeze:
                 if hasattr(_moe, 'freeze_experts'):
                     _moe.freeze_experts(new_to_freeze)
