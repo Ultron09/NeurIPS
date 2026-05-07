@@ -162,149 +162,18 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     backbone = ContinualResNet(num_classes=num_classes)
     model    = AdaptiveFramework(backbone, config=config).to(device)
 
-    # Kill framework auto-management
-    model.on_task_complete = lambda task_id: None
+    # [V31.8] ETERNAL MIND: Allow framework to handle boundaries natively.
+    # We no longer disable on_task_complete because it now contains critical stability logic.
     if hasattr(model, 'consolidation_scheduler') and model.consolidation_scheduler:
         model.consolidation_scheduler.should_consolidate = lambda *a, **k: (False, "External")
-    model.memory._update_sacred_core = lambda *a, **k: None
     model.health_monitor = None
 
     print(f"  Model device: {next(model.parameters()).device}")
 
     # ── V19 IRON MIND ──────────────────────────────────────────────────────────
-    model.memory.param_id_to_mask   = {}
-    model.memory.task_omega_snapshots = {}
+    # [V31.8] We rely on the native governance.py logic which is now identity-aware.
+    # No manual _v19_update injection needed.
 
-    # Per-task quota registry — each task's quota is stored so the union
-    # always re-evaluates each snapshot with its ORIGINAL quota
-    _task_quota_registry = {}
-
-    def _v19_update(mem, task_id, backbone_ref):
-        """
-        Top-K importance mask per task, union across tasks.
-        Flat 8% quota for all tasks — OGD handles forgetting via gradient projection.
-        FC rows, gate rows, and early backbone layers hard-locked.
-        """
-        PER_TASK_QUOTA = 0.30 if task_id == 0 else 0.08
-        _task_quota_registry[task_id] = PER_TASK_QUOTA
-
-        id_to_p = {}; id_to_imp = {}
-
-        with torch.no_grad():
-            for m_tracked in mem.models:
-                for name, p in m_tracked.named_parameters():
-                    if not p.requires_grad: continue
-                    pid = id(p)
-                    id_to_p[pid] = (name, p)
-                    # Read omega with BOTH key formats (bare name and m0_ prefix)
-                    curr = mem.omega.get(name, None)
-                    if curr is None:
-                        curr = mem.omega.get(f"m0_{name}", torch.zeros_like(p)).clone()
-                    else:
-                        curr = curr.clone()
-                        si_key = f"m0_{name}"
-                        if si_key in mem.omega:
-                            curr = curr + mem.omega[si_key].to(curr.device)
-                    if name in mem.fisher_dict:
-                        curr = curr + mem.fisher_dict[name].to(curr.device)
-                    if f"m0_{name}" in mem.fisher_dict:
-                        curr = curr + mem.fisher_dict[f"m0_{name}"].to(curr.device)
-                    id_to_imp[pid] = curr.abs() + torch.randn_like(curr) * 1e-12
-
-        if not id_to_imp: return
-
-        mem.task_omega_snapshots[task_id] = {pid: imp.clone() for pid, imp in id_to_imp.items()}
-
-        # Build cumulative union — each snapshot uses its OWN original quota
-        cumulative = {}
-        for tid_snap, snap in mem.task_omega_snapshots.items():
-            snap_quota = _task_quota_registry.get(tid_snap, 0.08)
-            flat = torch.cat([torch.nan_to_num(imp, 0., 0., 0.).view(-1) for imp in snap.values()])
-            n = flat.numel()
-            k = max(1, min(int(snap_quota * n), n))
-            _, top_idx = torch.topk(flat, k)
-            task_flat = torch.zeros_like(flat, dtype=torch.bool)
-            task_flat[top_idx] = True
-            pos = 0
-            for pid, imp in snap.items():
-                pn = imp.numel()
-                m  = task_flat[pos:pos+pn].view_as(imp)
-                cumulative[pid] = cumulative[pid] | m if pid in cumulative else m
-                pos += pn
-
-        # Hard-lock FC rows for all completed tasks — ALL expert FC heads
-        # H-MoE has 8 independent FC heads (domains.X.experts.Y.model.fc)
-        # All must be locked or Task N will overwrite Task 0's classification rows
-        for exp_name, exp_backbone in _all_expert_backbones:
-            fc = getattr(exp_backbone, 'fc', None)
-            if fc is None: continue
-            cpt = config.classes_per_task
-            fc_w_id = id(fc.weight)
-            if fc_w_id not in cumulative:
-                cumulative[fc_w_id] = torch.zeros(fc.weight.shape, dtype=torch.bool,
-                                                   device=fc.weight.device)
-            for tid in mem.task_omega_snapshots:
-                s, e = tid * cpt, min((tid + 1) * cpt, fc.weight.shape[0])
-                cumulative[fc_w_id][s:e, :] = True
-            if fc.bias is not None:
-                fc_b_id = id(fc.bias)
-                if fc_b_id not in cumulative:
-                    cumulative[fc_b_id] = torch.zeros(fc.bias.shape, dtype=torch.bool,
-                                                       device=fc.bias.device)
-                for tid in mem.task_omega_snapshots:
-                    s, e = tid * cpt, min((tid + 1) * cpt, fc.bias.shape[0])
-                    cumulative[fc_b_id][s:e] = True
-
-        # Hard-lock ALL gate weights after Task 0 — the gate learned to route
-        # Task 0 inputs correctly. Any change misroutes Task 0 inputs even if
-        # FC weights are frozen. Lock the entire gate, not just one row per task.
-        for m_tracked in mem.models:
-            for name, module in m_tracked.named_modules():
-                if "gate" in name.lower() and hasattr(module, 'weight'):
-                    g_id = id(module.weight)
-                    if g_id not in cumulative:
-                        cumulative[g_id] = torch.zeros(module.weight.shape, dtype=torch.bool,
-                                                        device=module.weight.device)
-                    # Lock ALL gate rows (entire gate frozen after first task)
-                    cumulative[g_id][:, :] = True
-                    if hasattr(module, 'bias') and module.bias is not None:
-                        gb_id = id(module.bias)
-                        if gb_id not in cumulative:
-                            cumulative[gb_id] = torch.zeros(module.bias.shape, dtype=torch.bool,
-                                                             device=module.bias.device)
-                        cumulative[gb_id][:] = True
-
-        # Hard-lock early backbone layers (conv1, layer1, layer2) after Task 0.
-        # These are universal feature detectors — if they change, Task 0's
-        # frozen FC rows receive wrong features and produce wrong predictions.
-        if task_id >= 0:  # Lock from Task 0 onwards
-            for exp_name, exp_backbone in _all_expert_backbones:
-                for layer_name in ['conv1', 'bn1', 'layer1', 'layer2']:
-                    layer = getattr(exp_backbone, layer_name, None)
-                    if layer is None: continue
-                    for p in layer.parameters():
-                        pid = id(p)
-                        if pid not in cumulative:
-                            cumulative[pid] = torch.zeros(p.shape, dtype=torch.bool, device=p.device)
-                        cumulative[pid][:] = True
-
-        # Commit masks
-        mem.param_id_to_mask = {}
-        all_names = {id(p): name for m_tracked in mem.models
-                     for name, p in m_tracked.named_parameters()}
-        protected = total_n = 0
-        for pid, mask in cumulative.items():
-            if pid not in id_to_p: continue
-            p = id_to_p[pid][1]
-            mem.param_id_to_mask[pid] = mask.to(p.device)
-            protected += mask.sum().item(); total_n += mask.numel()
-            if pid in all_names:
-                mem.sacred_mask[all_names[pid]] = mask.to(p.device)
-
-        mem.saturation_level = protected / total_n if total_n > 0 else 0.0
-        print(f"  [IRON MIND] Saturation: {mem.saturation_level:.2%} ({protected:,}/{total_n:,})")
-
-    model.memory._v19_update = _v19_update
 
     # ── Gradient sentinel hooks ────────────────────────────────────────────────
     hook_count = 0
@@ -462,30 +331,21 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                         bn_drift = max(bn_drift, d)
             print(f"  [BN DRIFT] Task {t_idx}: max BN running_mean drift = {bn_drift:.6f}")
 
-        # [BUGFIX] Weight Alignment (WA) to eliminate Recency Bias
-        if t_idx > 0:
-            with torch.no_grad():
-                for _, exp_bb in _all_expert_backbones:
-                    fc = getattr(exp_bb, 'fc', None)
-                    if fc is not None:
-                        old_w = fc.weight.data[:t_idx * cpt, :]
-                        new_w = fc.weight.data[t_idx * cpt:(t_idx + 1) * cpt, :]
-                        
-                        norm_old = torch.norm(old_w, dim=1).mean()
-                        norm_new = torch.norm(new_w, dim=1).mean()
-                        
-                        if norm_new > 0:
-                            gamma = norm_old / norm_new
-                            fc.weight.data[t_idx * cpt:(t_idx + 1) * cpt, :] *= gamma
-                            if fc.bias is not None:
-                                fc.bias.data[t_idx * cpt:(t_idx + 1) * cpt] *= gamma
-            print("  [WEIGHT ALIGNMENT] FC magnitudes normalized across all experts.")
+        # [V31.8] ETERNAL MIND: Standardized Weight Alignment
+        # The framework now handles WA internally during on_task_complete()
+        # to ensure it is applied BEFORE knowledge anchoring and cache rebuilding.
+        # This eliminates the need for external post-hoc scaling.
 
-        # ── Consolidation + Immutable Anchoring (V23) ──────────────────────────
-        print(f"  [ANTARA] Task {t_idx} complete. Anchoring Knowledge...")
-        model.memory.consolidate(task_id=t_idx, feedback_buffer=model.feedback_buffer)
+        # ── Consolidation + Immutable Anchoring (V31.8) ────────────────────────
+        # [V31.8] The framework's hardened on_task_complete handles:
+        # 1. Weight Alignment (WA)
+        # 2. SI/EWC Consolidation
+        # 3. Mask update (via Governor)
+        # 4. BN Lockdown & Cache Rebuild
+        model.on_task_complete(t_idx)
 
-        # Fast diagonal Fisher — use first expert backbone, stored with BOTH key formats
+        # [V31.8] Supplementary Fisher Calculation for SI Enhancement
+        # Fast diagonal Fisher — use first expert backbone
         _backbone = _all_expert_backbones[0][1] if _all_expert_backbones else model.memory.models[0]
         _backbone.eval()
         _fisher_x, _fisher_y = [], []
@@ -509,35 +369,6 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         _backbone.zero_grad()
         _backbone.train()
         print(f"  [FISHER] Fast diagonal Fisher computed on {_fisher_x.size(0)} samples.")
-
-        # V23 Immutable Anchoring — never overwrite sacred anchors
-        with torch.no_grad():
-            for m_tracked in model.memory.models:
-                for name, p in m_tracked.named_parameters():
-                    if not p.requires_grad: continue
-                    is_sacred = (name in model.memory.sacred_mask and
-                                 model.memory.sacred_mask[name].any())
-                    if not is_sacred:
-                        model.memory.anchor[name] = p.data.clone().detach()
-                    else:
-                        mask = model.memory.sacred_mask[name]
-                        if name not in model.memory.anchor:
-                            model.memory.anchor[name] = p.data.clone().detach()
-                        else:
-                            old = model.memory.anchor[name]
-                            model.memory.anchor[name] = torch.where(
-                                mask.to(p.device), old.to(p.device), p.data)
-                for name, b in m_tracked.named_buffers():
-                    if 'running_mean' in name or 'running_var' in name:
-                        prefix = name.rsplit('.', 1)[0]
-                        w_name = f"{prefix}.weight"
-                        is_sacred_bn = (w_name in model.memory.sacred_mask and
-                                        model.memory.sacred_mask[w_name].any())
-                        if not is_sacred_bn or name not in model.memory.anchor:
-                            model.memory.anchor[name] = b.data.clone().detach()
-
-        # V19 mask rebuild
-        model.memory._v19_update(model.memory, t_idx, _backbone_ref)
 
         # Diagnostic: verify FC rows are actually locked
         fc_locked = 0
