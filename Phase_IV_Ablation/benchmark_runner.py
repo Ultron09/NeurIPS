@@ -184,11 +184,15 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                     def hook(grad):
                         m = mem.param_id_to_mask.get(p_id)
                         if m is not None and m.any():
-                            return grad * (~m.to(grad.device))
+                            # [V31.11] ABSOLUTE SHUNT: Bit-perfect zeroing of sacred gradients.
+                            # Prevents Adam/momentum from drifting via residuals.
+                            grad.data[m] = 0.0
+                            return grad
                         return grad
                     return hook
                 p.register_hook(_make_hook(id(p), model.memory))
                 hook_count += 1
+
     print(f"  [IRON MIND] {hook_count} absolute gradient locks installed.")
 
     # ── Reptile protection — bypass data.copy_ for sacred weights ─────────────
@@ -264,23 +268,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         test_loaders.append(test_loader)
         train_loader.num_workers = 0; train_loader.pin_memory = True
 
-        # Unlock current task's FC rows before training — ALL expert FC heads
-        cpt = config.classes_per_task
-        s, e = t_idx * cpt, (t_idx + 1) * cpt
-        for k, mask in model.memory.sacred_mask.items():
-            if 'fc' in k.lower() and mask.dim() >= 1 and mask.shape[0] >= e:
-                with torch.no_grad():
-                    if mask.dim() == 1: mask[s:e].zero_()
-                    else: mask[s:e, :].zero_()
-        for pid, mask in model.memory.param_id_to_mask.items():
-            if mask.dim() >= 1 and mask.shape[0] >= e:
-                for _, exp_bb in _all_expert_backbones:
-                    for name, p in exp_bb.named_parameters():
-                        if id(p) == pid and 'fc' in name:
-                            with torch.no_grad():
-                                if mask.dim() == 1: mask[s:e].zero_()
-                                else: mask[s:e, :].zero_()
-        print(f"  [IRON MIND] FC rows {s}-{e-1} unlocked for Task {t_idx}")
+        # [V31.11] TITANIUM ISOLATION: 
+        # Manual FC unlocking removed. The framework now handles identity-aware
+        # unlocking via governance.py to ensure 100% preservation of old heads.
+
 
         print(f"\n[WARRIOR] Task {t_idx} | Epochs: {EPOCHS}")
 
@@ -344,31 +335,10 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # 4. BN Lockdown & Cache Rebuild
         model.on_task_complete(t_idx)
 
-        # [V31.8] Supplementary Fisher Calculation for SI Enhancement
-        # Fast diagonal Fisher — use first expert backbone
-        _backbone = _all_expert_backbones[0][1] if _all_expert_backbones else model.memory.models[0]
-        _backbone.eval()
-        _fisher_x, _fisher_y = [], []
-        for _bx, _by in train_loader:
-            _fisher_x.append(_bx); _fisher_y.append(_by)
-            if sum(t.size(0) for t in _fisher_x) >= 256: break
-        _fisher_x = torch.cat(_fisher_x)[:256].to(device).float()
-        _fisher_y = torch.cat(_fisher_y)[:256].to(device)
-        _backbone.zero_grad()
-        with torch.enable_grad():
-            _out = _backbone(_fisher_x)
-            if isinstance(_out, tuple): _out = _out[0]
-            F.cross_entropy(_out, _fisher_y).backward()
-        with torch.no_grad():
-            for name, p in _backbone.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    fisher_diag = p.grad.data.pow(2)
-                    for key in [name, f"m0_{name}"]:
-                        existing = model.memory.omega.get(key, torch.zeros_like(p))
-                        model.memory.omega[key] = existing + fisher_diag * 400.0
-        _backbone.zero_grad()
-        _backbone.train()
-        print(f"  [FISHER] Fast diagonal Fisher computed on {_fisher_x.size(0)} samples.")
+        # [V31.11] TITANIUM ISOLATION:
+        # Manual Fisher injection removed. Framework-native SI/EWC now operates 
+        # on the expert-isolated parameters to ensure consistent importance maps.
+
 
         # Diagnostic: verify FC rows are actually locked
         fc_locked = 0
