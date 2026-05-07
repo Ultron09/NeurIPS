@@ -341,6 +341,8 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
 
 
         # Diagnostic: verify FC rows are actually locked
+        cpt = config.classes_per_task
+        s, e = t_idx * cpt, (t_idx + 1) * cpt
         fc_locked = 0
         for _, exp_bb in _all_expert_backbones:
             fc = getattr(exp_bb, 'fc', None)
@@ -349,6 +351,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
                 mask = model.memory.param_id_to_mask.get(pid)
                 if mask is not None:
                     fc_locked += mask[:e, :].sum().item()
+
         print(f"  [FC CHECK] FC rows 0-{e-1} locked positions: {int(fc_locked):,} across {len(_all_expert_backbones)} experts")
 
         total_sacred = sum(m.sum().item() for m in model.memory.param_id_to_mask.values())
