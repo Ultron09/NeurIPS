@@ -18,12 +18,13 @@ Key differences from the broken version:
 import os
 import sys
 
-# [V9.8] MANDATORY: Force usage of vendored library
+# [V9.8] MANDATORY: Force usage of MirrorMind library
 root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-vendored_path = os.path.join(root_path, "antara_0.1.36")
+parent_path = os.path.dirname(root_path)
+vendored_path = os.path.join(parent_path, "Mirror_mind")
 if os.path.exists(vendored_path) and vendored_path not in sys.path:
     sys.path.insert(0, vendored_path)
-    print(f"[OK] Forced vendored library: {vendored_path}")
+    print(f"[OK] Forced MirrorMind library: {vendored_path}")
 
 import gc
 import types
