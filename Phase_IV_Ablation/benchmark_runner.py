@@ -121,7 +121,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
         "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
         "learning_rate": 2e-3,
         "ewc_lambda": 0.0,
-        "si_lambda": 1.0,
+        "si_lambda": 0.0,  # [V32] DISABLED: Iron Mind gradient shunts make SI redundant. SI penalty was exploding to 500+ and dominating task loss (~4.6).
         "use_reptile": True,
         "reptile_learning_rate": 0.1,
         "use_learned_optimizer": False,
@@ -129,7 +129,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
         "adaptation_threshold": 0.05,
         "use_gradient_centralization": True,
         "use_lookahead": True,
-        "use_ogd": True,
+        "use_ogd": False,  # [V32] DISABLED: Sacred mask already prevents updates to locked weights. OGD was redundant.
         "ogd_max_basis_size": 256,
         "memory_type": "si",
         "use_elastic_quota": False,
