@@ -272,6 +272,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
     _backbone_ref = _all_expert_backbones[0][1] if _all_expert_backbones else model.memory.models[0]
     print(f"  [SYSTEM] Found {len(_all_expert_backbones)} expert backbones for Iron Mind.")
 
+    # [V33] Define cpt before the loop — used in FC drift checks
+    cpt = config.classes_per_task
+
     for t_idx in range(num_tasks):
         train_loader, _, test_loader = curriculum.get_task(t_idx)
         test_loaders.append(test_loader)
