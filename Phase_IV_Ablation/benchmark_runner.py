@@ -92,7 +92,9 @@ class ContinualEvaluator:
         # calibrated for Task N's distribution — applying them to Task 0 inputs
         # amplifies Task N logits 2-3x, causing 0% Task 0 accuracy despite
         # frozen FC weights and frozen BN stats.
+        saved_introspection = getattr(self.model, 'introspection_enabled', True)
         saved_modifiers = getattr(self.model, 'current_modifiers', None)
+        self.model.introspection_enabled = False
         self.model.current_modifiers = None
         with torch.inference_mode():
             for x, y in loader:
@@ -102,6 +104,7 @@ class ContinualEvaluator:
                 if isinstance(logits, tuple): logits = logits[0]
                 correct += (logits.argmax(1) == y).sum().item()
                 total   += y.size(0)
+        self.model.introspection_enabled = saved_introspection
         self.model.current_modifiers = saved_modifiers
         return correct / total if total > 0 else 0.0
 
@@ -416,7 +419,9 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
         # Debug: check logit distribution for Task 0 after Task 1
         if t_idx == 1:
             model.eval()
+            saved_introspection = getattr(model, 'introspection_enabled', True)
             saved_mods = getattr(model, 'current_modifiers', None)
+            model.introspection_enabled = False
             model.current_modifiers = None
             sample_x, sample_y = next(iter(test_loaders[0]))
             sample_x = sample_x[:8].to(device).float()
@@ -424,6 +429,7 @@ def run_experiment(dataset_name="CIFAR100", stage_id=7, seed=42, epochs_override
             with torch.inference_mode():
                 logits = model.inference_step(sample_x)
                 if isinstance(logits, tuple): logits = logits[0]
+            model.introspection_enabled = saved_introspection
             model.current_modifiers = saved_mods
             print(f"  [DEBUG] Task 0 test sample labels: {sample_y.tolist()}")
             print(f"  [DEBUG] Logits shape: {logits.shape}")
