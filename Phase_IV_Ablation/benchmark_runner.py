@@ -121,7 +121,7 @@ def get_stage_config(stage_id: int, dataset_name: str):
         "classes_per_task": 20 if dataset_name == "TinyImageNet" else 10,
         "learning_rate": 2e-3,
         "ewc_lambda": 0.0,
-        "si_lambda": 0.0,  # [V32] DISABLED: Iron Mind gradient shunts make SI redundant. SI penalty was exploding to 500+ and dominating task loss (~4.6).
+        "si_lambda": 100.0,  # [V32] RE-ENABLED: Set to 100.0 since we normalized the penalty to a mean. Protects against forgetting!
         "use_reptile": True,
         "reptile_learning_rate": 0.1,
         "use_learned_optimizer": False,
