@@ -11,10 +11,7 @@ import torch
 import traceback
 
 def run_smoke():
-    from benchmark_runner import (
-        get_stage_config, model_factory, ExternalReplayBuffer,
-        ContinualTrainer, ContinualEvaluator, run_experiment
-    )
+    from benchmark_runner import run_experiment
     print("=" * 60)
     print("SMOKE TEST: 2 tasks x 2 epochs")
     print("=" * 60)

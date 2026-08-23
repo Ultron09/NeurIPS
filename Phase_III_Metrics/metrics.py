@@ -85,8 +85,8 @@ class MetricsEngine:
         fwt = self.calculate_fwt()
         
         # Strategic Alarms
-        bwt_status = "✅ PASS" if bwt >= -0.05 else "❌ FAIL (Forgetting too high)"
-        fwt_status = "✅ PASS" if fwt >= 0 else "⚠️ NEUTRAL (No Transfer seen)"
+        bwt_status = "PASS" if bwt >= -0.05 else "FAIL (Forgetting too high)"
+        fwt_status = "PASS" if fwt >= 0 else "NEUTRAL (No Transfer seen)"
         
         print(f"\n========================================\n"
               f"      NEURIPS GAUNTLET REPORT: {self.config_name}\n"

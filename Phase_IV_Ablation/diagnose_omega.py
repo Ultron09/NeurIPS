@@ -5,12 +5,13 @@ Expected runtime: ~12 minutes (Task 0 only).
 """
 import torch
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+for d in ['Phase_I_Curriculum', 'Phase_II_Baselines', 'Phase_III_Metrics']:
+    sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), d))
 
-from Phase_IV_Ablation.benchmark_runner import (
-    get_stage_config, model_factory, SplitCIFAR100,
-    ContinualTrainer, ExternalReplayBuffer
-)
+from benchmark_runner import get_stage_config
+from dataset import SplitCIFAR100
+from trainer import train_single_task
+from torchvision.models import resnet18
 from airborne_antara import AdaptiveFramework
 
 torch.manual_seed(42)
@@ -21,16 +22,16 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 data_path = os.path.join(os.path.dirname(__file__), "..", "data")
 
 config = get_stage_config(7, "CIFAR100")
-model = AdaptiveFramework(model_factory("CIFAR100", num_classes=100), config=config).to(device)
+raw_resnet = resnet18(num_classes=100)
+model = AdaptiveFramework(raw_resnet, config=config, device=device).to(device)
 model.memory.total_tasks = 10
 model.memory.num_classes = 100
 
 curriculum = SplitCIFAR100(root=data_path)
-trainer = ContinualTrainer(model, device=device)
 
 # Train Task 0
-train_loader, _, _ = curriculum.get_task(0)
-trainer.train_task(train_loader, 0, epochs=2)  # Only 2 epochs for speed
+train_loader, val_loader, _ = curriculum.get_task(0)
+train_single_task(model, train_loader, val_loader, None, 0, device=device, epochs=2)
 
 print("\n" + "="*70)
 print("DIAGNOSTIC: Memory State BEFORE on_task_complete")

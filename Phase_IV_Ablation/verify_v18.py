@@ -369,6 +369,7 @@ def run_experiment(method_name, device_str, wandb_sync=False, project="NeurIPS",
         metrics.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
     results_path = f"results/{full_method_name}_metrics.json"
+    os.makedirs(os.path.dirname(results_path), exist_ok=True)
     metrics.save_results(results_path)
     metrics.plot_heatmap(f"results/{full_method_name}_heatmap.png")
     metrics.generate_summary_report()
